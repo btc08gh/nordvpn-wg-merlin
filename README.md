@@ -62,6 +62,12 @@ Before NVRAM writes, the current slot is backed up under `/opt/var/lib/nordvpn-w
 - Interactive menu from NordConverter is not ported yet.
 - Live Merlin behavior must be tested on target firmware before calling this production-ready.
 
-## Attribution
+## Upstream projects / attribution
 
-Design/code was informed by the user-provided NordConverter project and `caleb9/asuswrt-merlin-nordvpn-wg-updater`. The latter in turn credits `sfiorini/NordVPN-Wireguard`. This project is a new implementation rather than a line-for-line merge.
+This project intentionally builds on ideas and implementation patterns from these upstream projects:
+
+- **Deano86/NordConverter** — https://github.com/Deano86/NordConverter — source for NordVPN server-selection, interactive/config-generation behavior, and related creature features we plan to adapt.
+- **caleb9/asuswrt-merlin-nordvpn-wg-updater** — https://github.com/caleb9/asuswrt-merlin-nordvpn-wg-updater — source for Asuswrt-Merlin-specific WireGuard/NVRAM update patterns and router-native integration ideas.
+- The Merlin updater project in turn credits **sfiorini/NordVPN-Wireguard**.
+
+Where code is copied or materially adapted, we will preserve the applicable upstream license notices and attribution. This repository is intended to combine and extend those capabilities into a router-native NordVPN WireGuard management tool for Asuswrt-Merlin.
