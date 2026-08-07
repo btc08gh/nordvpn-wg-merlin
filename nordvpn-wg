@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.1.1
+# v0.1.2
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.1.1"
+VERSION="0.1.2"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -86,7 +86,26 @@ EOF
 log() { printf '[i] %s\n' "$*"; }
 ok() { printf '[+] %s\n' "$*"; }
 die() { printf '[x] %s\n' "$*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+have_cmd() {
+  case "$1" in
+    */*) [ -x "$1" ] ;;
+    *)
+      old_ifs=$IFS
+      IFS=:
+      for d in $PATH; do
+        [ -n "$d" ] || d=.
+        if [ -x "$d/$1" ]; then
+          IFS=$old_ifs
+          return 0
+        fi
+      done
+      IFS=$old_ifs
+      return 1
+      ;;
+  esac
+}
+need() { have_cmd "$1" || die "Required command not found: $1"; }
 
 load_config() {
   [ -f "$DEFAULT_CONFIG" ] && . "$DEFAULT_CONFIG"
@@ -290,7 +309,6 @@ merlin_update() {
 }
 
 # First pass: discover --config before loading defaults/overrides.
-args="$*"
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--config" ]; then CONFIG_FILE="$arg"; prev=""; continue; fi
