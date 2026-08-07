@@ -1,0 +1,46 @@
+# nordvpn-wg.conf - defaults for NordVPN WireGuard Manager
+# Install as /opt/etc/nordvpn-wg.conf
+#
+# Precedence: built-in defaults < this file < CLI options.
+# This file is sourced by bash. Keep it writable only by administrators.
+
+# ---- Nord account ----------------------------------------------------------
+# Recommended: put ONLY the token on the first line of this file and chmod 600.
+TOKEN_FILE="/opt/etc/nordvpn-wg/token"
+# ACCESS_TOKEN=""  # Supported, but storing the token directly here is less tidy.
+
+# ---- Files/state -----------------------------------------------------------
+STATE_DIR="/opt/var/lib/nordvpn-wg"
+OUTPUT_DIR="/opt/var/lib/nordvpn-wg/profiles"
+
+# ---- WireGuard defaults ----------------------------------------------------
+# NordLynx client address used by Nord's manual WireGuard setups.
+WG_ADDRESS="10.5.0.2/32"
+
+# Router-local DNS is a good Merlin default when dnsmasq is handling LAN DNS.
+WG_DNS="192.168.50.1"
+
+WG_ALLOWED_IPS="0.0.0.0/0,::/0"
+WG_ENDPOINT_PORT="51820"
+WG_KEEPALIVE="60"
+WG_MTU=""                       # Blank = let Merlin/kernel choose.
+
+# ---- Asuswrt-Merlin wgcN defaults -----------------------------------------
+MERLIN_ENABLE="1"               # Enable the WireGuard client.
+MERLIN_ENFORCE="1"              # Merlin kill-switch setting for routed clients.
+MERLIN_FIREWALL="1"             # Block unsolicited inbound traffic from tunnel.
+MERLIN_NAT="1"                  # NAT traffic exiting the tunnel.
+MERLIN_PSK=""                   # Nord does not require a preshared key.
+MERLIN_TP=""
+MERLIN_TP_REGION=""
+
+# "ip" matches configs such as ep_addr=187.40.235.112 and avoids endpoint DNS.
+# "hostname" stores e.g. us12345.nordvpn.com while ep_addr_r retains station IP.
+MERLIN_ENDPOINT_MODE="ip"
+
+# ---- Safety/application ----------------------------------------------------
+BACKUP_BEFORE_WRITE="1"         # Save existing wgcN_* variables before changes.
+NVRAM_COMMIT="1"                # Persist changes across reboot.
+AUTO_APPLY="1"                  # service "restart_wgc N" after a write.
+VERIFY_HANDSHAKE="1"            # Wait for wg latest-handshakes after apply.
+VERIFY_TIMEOUT="15"             # Seconds.
