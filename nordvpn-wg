@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.2.0
+# v0.2.1
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.2.0"
+VERSION="0.2.1"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -35,6 +35,8 @@ MERLIN_TP_REGION=""
 MERLIN_ENDPOINT_MODE="ip"
 BACKUP_BEFORE_WRITE="1"
 NVRAM_COMMIT="1"
+VERIFY_HANDSHAKE="1"
+VERIFY_TIMEOUT="15"
 
 COUNTRY=""
 CITY=""
@@ -69,6 +71,7 @@ Usage:
 
   $APP_NAME merlin list
   $APP_NAME merlin show wgcN [--show-secrets]
+  $APP_NAME merlin status wgcN
   $APP_NAME merlin diff wgcN [filters]
   $APP_NAME merlin create wgcN [filters] [--dry-run] [--apply]
   $APP_NAME merlin update wgcN [filters] [--dry-run] [--apply]
@@ -114,6 +117,7 @@ EOF
 
 log() { printf '[i] %s\n' "$*"; }
 ok() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
 die() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
 have_cmd() {
@@ -304,6 +308,92 @@ merlin_show() {
   done
 }
 
+human_bytes() {
+  hb=$1
+  awk -v b="$hb" 'BEGIN {
+    if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+    else if (b >= 1048576) printf "%.2f MiB", b/1048576;
+    else if (b >= 1024) printf "%.2f KiB", b/1024;
+    else printf "%d B", b;
+  }'
+}
+
+handshake_epoch() {
+  hs_c=$1
+  wg show "$hs_c" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}'
+}
+
+merlin_status() {
+  status_c=$1
+  validate_client "$status_c"
+  merlin_preflight
+  desc=$(nvram get "${status_c}_desc")
+  enabled=$(nvram get "${status_c}_enable")
+  configured_endpoint=$(nvram get "${status_c}_ep_addr")
+  configured_port=$(nvram get "${status_c}_ep_port")
+  rip=$(nvram get "${status_c}_rip")
+
+  printf 'Client:              %s\n' "$status_c"
+  printf 'Description:         %s\n' "${desc:--}"
+  printf 'NVRAM enabled:       %s\n' "${enabled:-0}"
+  printf 'Configured endpoint: %s:%s\n' "${configured_endpoint:--}" "${configured_port:--}"
+  printf 'Cached public IP:    %s\n' "${rip:--}"
+
+  if ! wg show "$status_c" >/dev/null 2>&1; then
+    printf 'Interface:           down\n'
+    printf 'Handshake:           none\n'
+    return 1
+  fi
+
+  live_endpoint=$(wg show "$status_c" endpoints 2>/dev/null | awk 'NR==1 {print $2}')
+  hs=$(handshake_epoch "$status_c")
+  transfer=$(wg show "$status_c" transfer 2>/dev/null | awk 'NR==1 {print $2 " " $3}')
+  rx=$(printf '%s' "$transfer" | awk '{print $1}')
+  tx=$(printf '%s' "$transfer" | awk '{print $2}')
+  [ -n "$rx" ] || rx=0
+  [ -n "$tx" ] || tx=0
+
+  printf 'Interface:           up\n'
+  printf 'Live endpoint:       %s\n' "${live_endpoint:--}"
+  if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then
+    now=$(date +%s)
+    age=$((now - hs))
+    [ "$age" -lt 0 ] && age=0
+    printf 'Handshake:           %s seconds ago\n' "$age"
+  else
+    printf 'Handshake:           never\n'
+  fi
+  printf 'Transfer RX:         %s\n' "$(human_bytes "$rx")"
+  printf 'Transfer TX:         %s\n' "$(human_bytes "$tx")"
+}
+
+verify_handshake() {
+  verify_c=$1
+  before_hs=${2:-0}
+  [ "$VERIFY_HANDSHAKE" = "1" ] || return 0
+  timeout=$VERIFY_TIMEOUT
+  case "$timeout" in ''|*[!0-9]*) timeout=15 ;; esac
+  waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if wg show "$verify_c" >/dev/null 2>&1; then
+      after_hs=$(handshake_epoch "$verify_c")
+      if [ -n "$after_hs" ] && [ "$after_hs" -gt 0 ] 2>/dev/null; then
+        if [ "$before_hs" -eq 0 ] 2>/dev/null || [ "$after_hs" -gt "$before_hs" ] 2>/dev/null; then
+          now=$(date +%s)
+          age=$((now - after_hs))
+          [ "$age" -lt 0 ] && age=0
+          ok "$verify_c handshake established (${age}s ago)."
+          return 0
+        fi
+      fi
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "$verify_c restarted but no new handshake was observed within ${timeout}s. Run '$APP_NAME merlin status $verify_c'."
+  return 1
+}
+
 select_profile() {
   f=$(tmpfile candidates.json)
   fetch_candidates_to_file "$f"
@@ -373,16 +463,22 @@ apply_client() {
   apply_c=$1
   validate_client "$apply_c"
   merlin_preflight
+  before_hs=$(handshake_epoch "$apply_c" || true)
+  [ -n "$before_hs" ] || before_hs=0
   service "restart_wgc ${apply_c#wgc}"
   ok "$apply_c restarted."
+  verify_handshake "$apply_c" "$before_hs" || true
 }
 
 start_client() {
   start_c=$1
   validate_client "$start_c"
   merlin_preflight
+  before_hs=$(handshake_epoch "$start_c" || true)
+  [ -n "$before_hs" ] || before_hs=0
   service "start_wgc ${start_c#wgc}"
   ok "$start_c start requested."
+  verify_handshake "$start_c" "$before_hs" || true
 }
 
 stop_client() {
@@ -490,6 +586,7 @@ merlin_diff() {
   print_diff_field "${c}_tp_region" "$MERLIN_TP_REGION"
   print_diff_field "${c}_aips" "$WG_ALLOWED_IPS"
   printf '\nNo NVRAM changes were made.\n'
+  printf 'To create exactly this proposal:\n  %s merlin create %s --server %s\n' "$APP_NAME" "$c" "$hostname"
 }
 
 merlin_backup_cmd() {
@@ -568,7 +665,7 @@ if [ "$cmd" = "merlin" ]; then
   subcmd=$1
   shift
   case "$subcmd" in
-    show|diff|create|update|apply|restart|start|stop|enable|disable|backup|restore)
+    show|status|diff|create|update|apply|restart|start|stop|enable|disable|backup|restore)
       [ "$#" -gt 0 ] || die "Missing wgcN client."
       client=$1
       shift
@@ -615,6 +712,7 @@ case "$cmd" in
     case "$subcmd" in
       list) merlin_list ;;
       show) merlin_show "$client" ;;
+      status) merlin_status "$client" ;;
       diff) merlin_diff "$client" ;;
       create) merlin_create "$client" ;;
       update) merlin_update "$client" ;;
