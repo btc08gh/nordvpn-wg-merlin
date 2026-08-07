@@ -1,6 +1,6 @@
 # nordvpn-wg — NordVPN WireGuard Manager for Asuswrt-Merlin
 
-Early v0.1.0 prototype combining the rich selection/config-generation ideas of NordConverter with direct Asuswrt-Merlin WireGuard client management.
+Early v0.1.0 prototype combining the server-selection/config-generation ideas of NordConverter with direct Asuswrt-Merlin WireGuard client management.
 
 ## Scope
 
@@ -22,22 +22,37 @@ opkg install bash curl jq
 ## Install
 
 ```sh
-./install.sh
+git clone https://github.com/btc08gh/nordvpn-wg-merlin.git
+cd nordvpn-wg-merlin
+sh install.sh
 printf '%s\n' 'YOUR_NORD_ACCESS_TOKEN' > /opt/etc/nordvpn-wg/token
 chmod 600 /opt/etc/nordvpn-wg/token
 ```
 
 Review `/opt/etc/nordvpn-wg.conf` before first use.
 
-## First commands
+## First safe tests
 
 ```sh
+nordvpn-wg --version
 nordvpn-wg countries
 nordvpn-wg servers --country US --limit 10
-nordvpn-wg config --country US --city Dallas
 nordvpn-wg merlin list
 nordvpn-wg merlin show wgc3
-nordvpn-wg merlin create wgc3 --country US --city Dallas --dry-run
+```
+
+Then exercise the write path without changing NVRAM:
+
+```sh
+nordvpn-wg merlin create wgc3 --country US --city "St Louis" --dry-run
+```
+
+Do **not** run `merlin create` without `--dry-run` until the proposed values have been compared with a known-good Merlin client on the target router.
+
+Other implemented commands include:
+
+```sh
+nordvpn-wg config --country US --city Dallas
 nordvpn-wg merlin create wgc3 --country US --city Dallas
 nordvpn-wg merlin update wgc3 --country US
 ```
@@ -59,15 +74,15 @@ Before NVRAM writes, the current slot is backed up under `/opt/var/lib/nordvpn-w
 - City filtering currently filters the first 100 country recommendations; a later revision will use a cached full catalogue for exhaustive city/group searches.
 - Backup restore command is not implemented yet.
 - Scheduled refresh is not implemented yet.
-- Interactive menu from NordConverter is not ported yet.
+- Interactive menu/creature features inspired by NordConverter are not ported yet.
 - Live Merlin behavior must be tested on target firmware before calling this production-ready.
 
 ## Upstream projects / attribution
 
-This project intentionally builds on ideas and implementation patterns from these upstream projects:
+This project intentionally draws on behavior, ideas, and documented workflows from:
 
-- **Deano86/NordConverter** — https://github.com/Deano86/NordConverter — source for NordVPN server-selection, interactive/config-generation behavior, and related creature features we plan to adapt.
-- **caleb9/asuswrt-merlin-nordvpn-wg-updater** — https://github.com/caleb9/asuswrt-merlin-nordvpn-wg-updater — source for Asuswrt-Merlin-specific WireGuard/NVRAM update patterns and router-native integration ideas.
-- The Merlin updater project in turn credits **sfiorini/NordVPN-Wireguard**.
+- **Deano86/NordConverter** — https://github.com/Deano86/NordConverter
+- **caleb9/asuswrt-merlin-nordvpn-wg-updater** — https://github.com/caleb9/asuswrt-merlin-nordvpn-wg-updater
+- The Merlin updater project also references **sfiorini/NordVPN-Wireguard**.
 
-Where code is copied or materially adapted, we will preserve the applicable upstream license notices and attribution. This repository is intended to combine and extend those capabilities into a router-native NordVPN WireGuard management tool for Asuswrt-Merlin.
+NordConverter's current NOTICE states that no open-source license is granted unless a separate LICENSE is added. Accordingly, this project treats NordConverter as a behavioral/design reference and does not copy its source verbatim without permission or an applicable license. See `NOTICE.md` for details.
