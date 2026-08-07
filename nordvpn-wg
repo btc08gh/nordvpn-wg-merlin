@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# NordVPN WireGuard Manager for Asuswrt-Merlin
+# v0.1.0
+set -Eeuo pipefail
+
+PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+readonly APP_NAME="nordvpn-wg"
+readonly VERSION="0.1.0"
+readonly NORD_API="https://api.nordvpn.com/v1"
+readonly DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
+readonly DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
+readonly DEFAULT_STATE_DIR="/opt/var/lib/nordvpn-wg"
+
+CONFIG_FILE="$DEFAULT_CONFIG"
+TOKEN_FILE="$DEFAULT_TOKEN_FILE"
+STATE_DIR="$DEFAULT_STATE_DIR"
+OUTPUT_DIR="${PWD}"
+
+WG_ADDRESS="10.5.0.2/32"
+WG_DNS="192.168.50.1"
+WG_ALLOWED_IPS="0.0.0.0/0,::/0"
+WG_ENDPOINT_PORT="51820"
+WG_KEEPALIVE="60"
+WG_MTU=""
+
+MERLIN_ENABLE="1"
+MERLIN_ENFORCE="1"
+MERLIN_FIREWALL="1"
+MERLIN_NAT="1"
+MERLIN_PSK=""
+MERLIN_TP=""
+MERLIN_TP_REGION=""
+MERLIN_ENDPOINT_MODE="ip"
+
+VERIFY_HANDSHAKE="1"
+VERIFY_TIMEOUT="15"
+BACKUP_BEFORE_WRITE="1"
+NVRAM_COMMIT="1"
+AUTO_APPLY="1"
+
+COUNTRY=""
+CITY=""
+SERVER=""
+GROUP=""
+DESCRIPTION=""
+LIMIT="10"
+ASSUME_YES="0"
+DRY_RUN="0"
+QUIET="0"
+ACCESS_TOKEN="${NORDVPN_TOKEN:-}"
+PROFILE_JSON=""
+
+usage() {
+  cat <<EOF
+$APP_NAME $VERSION
+
+Router-native NordVPN WireGuard configuration manager.
+Requires Entware, bash, curl, jq, and Asuswrt-Merlin tools for NVRAM mode.
+
+Usage:
+  $APP_NAME countries
+  $APP_NAME servers [filters]
+  $APP_NAME config [filters] [--output-dir DIR]
+  $APP_NAME merlin list
+  $APP_NAME merlin show wgcN
+  $APP_NAME merlin create wgcN [filters]
+  $APP_NAME merlin update wgcN [filters]
+
+Server filters:
+  --country NAME|CODE
+  --city NAME
+  --server HOSTNAME
+  --group NAME
+  --limit N
+
+Configuration/output:
+  --config FILE
+  --token TOKEN
+  --token-file FILE
+  --output-dir DIR
+  --desc TEXT
+  --dns IP
+  --keepalive N
+  --mtu N
+  --endpoint ip|hostname
+
+Safety:
+  --yes, -y
+  --dry-run
+  -h, --help
+  -v, --version
+
+Precedence: built-ins < $DEFAULT_CONFIG < --config FILE < CLI options
+EOF
+}
+
+log()  { (( QUIET )) || printf '[i] %s\n' "$*"; }
+ok()   { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { printf '[x] %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+load_config_file() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+read_token() {
+  if [[ -n "$ACCESS_TOKEN" ]]; then printf '%s' "$ACCESS_TOKEN"; return; fi
+  if [[ -r "$TOKEN_FILE" ]]; then
+    local token
+    IFS= read -r token < "$TOKEN_FILE" || true
+    [[ -n "$token" ]] || die "Token file is empty: $TOKEN_FILE"
+    printf '%s' "$token"
+    return
+  fi
+  die "No Nord access token. Use $TOKEN_FILE, --token-file, or --token."
+}
+
+api_get() {
+  local url=$1
+  shift || true
+  curl -fsSL --connect-timeout 10 --max-time 30 "$url" "$@"
+}
+
+fetch_private_key() {
+  local token json key
+  token=$(read_token)
+  json=$(curl -fsSL --connect-timeout 10 --max-time 30 -u "token:${token}" \
+    "${NORD_API}/users/services/credentials") || die 'Unable to retrieve Nord service credentials.'
+  key=$(jq -er '.nordlynx_private_key | select(type=="string" and length>20)' <<<"$json") \
+    || die 'Nord API did not return a NordLynx private key. Check the access token.'
+  printf '%s' "$key"
+}
+
+normalize_key() {
+  local v=${1,,}
+  v=${v// /_}; v=${v//-/_}
+  printf '%s' "$v"
+}
+
+resolve_country_id() {
+  local requested=$1 json key
+  key=$(normalize_key "$requested")
+  json=$(api_get "${NORD_API}/servers/countries") || return 1
+  jq -er --arg key "$key" '[ .[] | select(
+      ((.code // "") | ascii_downcase) == $key or
+      ((.name // "") | ascii_downcase | gsub("[ _-]+"; "_")) == $key
+    ) ][0].id' <<<"$json"
+}
+
+server_public_key_jq='(.technologies[]? | select(.identifier == "wireguard_udp") | .metadata[]? | select((.name // "") == "public_key") | .value) // empty'
+
+build_recommendations_url() {
+  local country_id="" url
+  url="${NORD_API}/servers/recommendations?filters[servers.status]=online&filters[servers_technologies][identifier]=wireguard_udp&limit=100"
+  if [[ -n "$COUNTRY" ]]; then
+    country_id=$(resolve_country_id "$COUNTRY") || die "Unknown NordVPN country: $COUNTRY"
+    url+="&filters[country_id]=${country_id}"
+  fi
+  printf '%s' "$url"
+}
+
+fetch_candidates() {
+  local json url server_fqdn
+  if [[ -n "$SERVER" ]]; then
+    server_fqdn=$SERVER
+    [[ "$server_fqdn" == *.nordvpn.com ]] || server_fqdn+=".nordvpn.com"
+    json=$(api_get "${NORD_API}/servers?limit=10000") || die 'Unable to download Nord server catalogue.'
+    jq -c --arg h "${server_fqdn,,}" '[ .[]
+      | select((.hostname // "" | ascii_downcase) == $h)
+      | select(any(.technologies[]?; .identifier == "wireguard_udp")) ]' <<<"$json"
+    return
+  fi
+
+  url=$(build_recommendations_url)
+  json=$(api_get "$url") || die 'Unable to retrieve Nord server recommendations.'
+  jq -c --arg city "$CITY" --arg group "$GROUP" '[ .[]
+      | select(any(.technologies[]?; .identifier == "wireguard_udp"))
+      | select(($city == "") or ((.locations[0].country.city.name // "") | ascii_downcase) == ($city | ascii_downcase))
+      | select(($group == "") or any(.groups[]?;
+          ((.identifier // "") | ascii_downcase) == ($group | ascii_downcase) or
+          ((.title // "") | ascii_downcase) == ($group | ascii_downcase))) ]' <<<"$json"
+}
+
+select_profile() {
+  local candidates count private_key chosen peer_key endpoint_ip hostname country city load endpoint
+  candidates=$(fetch_candidates)
+  count=$(jq 'length' <<<"$candidates")
+  (( count > 0 )) || die 'No matching online NordLynx servers found.'
+  chosen=$(jq -c '.[0]' <<<"$candidates")
+  private_key=$(fetch_private_key)
+  peer_key=$(jq -er "$server_public_key_jq" <<<"$chosen") || die 'Selected server has no WireGuard public key.'
+  endpoint_ip=$(jq -er '.station' <<<"$chosen") || die 'Selected server has no endpoint IP.'
+  hostname=$(jq -er '.hostname' <<<"$chosen") || die 'Selected server has no hostname.'
+  country=$(jq -r '.locations[0].country.name // "Unknown"' <<<"$chosen")
+  city=$(jq -r '.locations[0].country.city.name // "Unknown"' <<<"$chosen")
+  load=$(jq -r '.load // 0' <<<"$chosen")
+  if [[ "$MERLIN_ENDPOINT_MODE" == "hostname" ]]; then endpoint=$hostname; else endpoint=$endpoint_ip; fi
+
+  PROFILE_JSON=$(jq -cn \
+    --arg private_key "$private_key" --arg address "$WG_ADDRESS" --arg dns "$WG_DNS" \
+    --arg allowed_ips "$WG_ALLOWED_IPS" --arg peer_key "$peer_key" --arg hostname "$hostname" \
+    --arg endpoint_ip "$endpoint_ip" --arg endpoint "$endpoint" --arg port "$WG_ENDPOINT_PORT" \
+    --arg keepalive "$WG_KEEPALIVE" --arg mtu "$WG_MTU" --arg country "$country" --arg city "$city" \
+    --argjson load "$load" \
+    '{private_key:$private_key,address:$address,dns:$dns,allowed_ips:$allowed_ips,
+      peer_key:$peer_key,hostname:$hostname,endpoint_ip:$endpoint_ip,endpoint:$endpoint,
+      port:$port,keepalive:$keepalive,mtu:$mtu,country:$country,city:$city,load:$load}')
+}
+
+print_servers() {
+  local candidates
+  candidates=$(fetch_candidates)
+  printf '%-22s %-16s %-24s %5s  %s\n' HOSTNAME COUNTRY CITY LOAD IP
+  jq -r --argjson limit "$LIMIT" '.[:$limit][] | [
+      (.hostname // "-"),(.locations[0].country.name // "-"),(.locations[0].country.city.name // "-"),
+      ((.load // 0)|tostring),(.station // "-") ] | @tsv' <<<"$candidates" |
+    awk -F '\t' '{printf "%-22s %-16s %-24s %4s%%  %s\n",$1,$2,$3,$4,$5}'
+}
+
+list_countries() {
+  api_get "${NORD_API}/servers/countries" | jq -r '.[] | [.code,.name] | @tsv' | sort -k2
+}
+
+safe_label() {
+  local s=$1
+  s=${s%.nordvpn.com}; s=${s//[^A-Za-z0-9_.-]/_}
+  printf '%s' "$s"
+}
+
+write_conf() {
+  local hostname path tmp
+  hostname=$(jq -r '.hostname' <<<"$PROFILE_JSON")
+  mkdir -p "$OUTPUT_DIR"
+  path="${OUTPUT_DIR%/}/NordVPN-$(safe_label "$hostname").conf"
+  [[ ! -e "$path" ]] || path="${path%.conf}-$(date +%Y%m%d-%H%M%S).conf"
+  tmp=$(mktemp "${OUTPUT_DIR%/}/.nordvpn-wg.XXXXXX")
+  umask 077
+  {
+    printf '[Interface]\nAddress = %s\nPrivateKey = %s\n' "$WG_ADDRESS" "$(jq -r '.private_key' <<<"$PROFILE_JSON")"
+    [[ -z "$WG_MTU" ]] || printf 'MTU = %s\n' "$WG_MTU"
+    [[ -z "$WG_DNS" ]] || printf 'DNS = %s\n' "$WG_DNS"
+    printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepalive = %s\n' \
+      "$(jq -r '.peer_key' <<<"$PROFILE_JSON")" "$WG_ALLOWED_IPS" \
+      "$(jq -r '.endpoint' <<<"$PROFILE_JSON")" "$WG_ENDPOINT_PORT" "$WG_KEEPALIVE"
+  } >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$path"
+  ok "Created $path"
+}
+
+validate_client() { [[ "$1" =~ ^wgc([1-5])$ ]] || die 'Merlin client must be wgc1 through wgc5.'; }
+client_unit() { printf '%s' "${1#wgc}"; }
+
+merlin_preflight() {
+  need nvram; need wg; need service
+  [[ -n "$(nvram get productid 2>/dev/null || true)" ]] || die 'This does not appear to be an Asuswrt-Merlin router.'
+}
+
+merlin_list() {
+  local i c desc enabled ep rip
+  merlin_preflight
+  printf '%-5s %-7s %-24s %-24s %s\n' SLOT ENABLED DESCRIPTION ENDPOINT PUBLIC_IP
+  for i in 1 2 3 4 5; do
+    c="wgc$i"
+    desc=$(nvram get "${c}_desc"); enabled=$(nvram get "${c}_enable")
+    ep=$(nvram get "${c}_ep_addr"); rip=$(nvram get "${c}_rip")
+    [[ -n "$desc$ep$enabled" ]] || continue
+    printf '%-5s %-7s %-24.24s %-24.24s %s\n' "$c" "${enabled:-0}" "${desc:--}" "${ep:--}" "${rip:--}"
+  done
+}
+
+merlin_show() {
+  local client=$1
+  validate_client "$client"; merlin_preflight
+  nvram show 2>/dev/null | grep "^${client}_" | sort
+}
+
+backup_client() {
+  local client=$1 dir file
+  (( BACKUP_BEFORE_WRITE )) || return 0
+  dir="${STATE_DIR%/}/backups"; mkdir -p "$dir"
+  file="$dir/${client}-$(date +%Y%m%d-%H%M%S).nvram"
+  nvram show 2>/dev/null | grep "^${client}_" | sort >"$file" || true
+  chmod 600 "$file"; log "Backup: $file"
+}
+
+nv_set() {
+  local key=$1 value=$2
+  if (( DRY_RUN )); then printf '[dry-run] nvram set %q=%q\n' "$key" "$value"; else nvram set "${key}=${value}"; fi
+}
+
+confirm_replace() {
+  local client=$1 existing ans
+  (( ASSUME_YES )) && return 0
+  existing=$(nvram get "${client}_desc")
+  if [[ -n "$existing" ]]; then
+    printf 'About to replace/update %s (%s). Continue? [y/N] ' "$client" "$existing" >&2
+  else
+    printf 'About to create %s. Continue? [y/N] ' "$client" >&2
+  fi
+  IFS= read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || die 'Cancelled.'
+}
+
+profile_desc() {
+  [[ -z "$DESCRIPTION" ]] || { printf '%s' "$DESCRIPTION"; return; }
+  local city country
+  city=$(jq -r '.city' <<<"$PROFILE_JSON"); country=$(jq -r '.country' <<<"$PROFILE_JSON")
+  if [[ "$city" != "Unknown" ]]; then printf 'Nord %s' "$city"; else printf 'Nord %s' "$country"; fi
+}
+
+merlin_write_full() {
+  local c=$1
+  nv_set "${c}_addr" "$WG_ADDRESS"
+  nv_set "${c}_alive" "$WG_KEEPALIVE"
+  nv_set "${c}_desc" "$(profile_desc)"
+  nv_set "${c}_dns" "$WG_DNS"
+  nv_set "${c}_enable" "$MERLIN_ENABLE"
+  nv_set "${c}_enforce" "$MERLIN_ENFORCE"
+  nv_set "${c}_ep_addr" "$(jq -r '.endpoint' <<<"$PROFILE_JSON")"
+  nv_set "${c}_ep_addr_r" "$(jq -r '.endpoint_ip' <<<"$PROFILE_JSON")"
+  nv_set "${c}_ep_port" "$WG_ENDPOINT_PORT"
+  nv_set "${c}_fw" "$MERLIN_FIREWALL"
+  nv_set "${c}_mtu" "$WG_MTU"
+  nv_set "${c}_nat" "$MERLIN_NAT"
+  nv_set "${c}_ppub" "$(jq -r '.peer_key' <<<"$PROFILE_JSON")"
+  nv_set "${c}_priv" "$(jq -r '.private_key' <<<"$PROFILE_JSON")"
+  nv_set "${c}_psk" "$MERLIN_PSK"
+  nv_set "${c}_tp" "$MERLIN_TP"
+  nv_set "${c}_tp_region" "$MERLIN_TP_REGION"
+  nv_set "${c}_aips" "$WG_ALLOWED_IPS"
+  # wgcN_rip is runtime state and intentionally never written.
+}
+
+merlin_write_server_only() {
+  local c=$1
+  nv_set "${c}_desc" "$(profile_desc)"
+  nv_set "${c}_ep_addr" "$(jq -r '.endpoint' <<<"$PROFILE_JSON")"
+  nv_set "${c}_ep_addr_r" "$(jq -r '.endpoint_ip' <<<"$PROFILE_JSON")"
+  nv_set "${c}_ep_port" "$WG_ENDPOINT_PORT"
+  nv_set "${c}_ppub" "$(jq -r '.peer_key' <<<"$PROFILE_JSON")"
+}
+
+apply_client() {
+  local client=$1 unit
+  (( DRY_RUN )) && return 0
+  (( NVRAM_COMMIT )) && nvram commit
+  (( AUTO_APPLY )) || return 0
+  unit=$(client_unit "$client")
+  service "restart_wgc ${unit}" >/dev/null 2>&1 || warn "Merlin restart request failed for $client. NVRAM is saved."
+}
+
+verify_client() {
+  local client=$1 elapsed=0 handshake rip
+  (( DRY_RUN )) && return 0
+  (( VERIFY_HANDSHAKE )) || return 0
+  while (( elapsed < VERIFY_TIMEOUT )); do
+    handshake=$(wg show "$client" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+    if [[ "$handshake" =~ ^[0-9]+$ ]] && (( handshake > 0 )); then
+      rip=$(nvram get "${client}_rip")
+      ok "$client handshake established${rip:+; public IP $rip}"
+      return 0
+    fi
+    sleep 1; ((elapsed+=1))
+  done
+  warn "$client did not show a WireGuard handshake within ${VERIFY_TIMEOUT}s."
+  return 1
+}
+
+merlin_create() {
+  local client=$1
+  validate_client "$client"; merlin_preflight; select_profile
+  confirm_replace "$client"; backup_client "$client"; merlin_write_full "$client"
+  apply_client "$client"; verify_client "$client" || true
+  ok "$client configured for $(jq -r '.hostname' <<<"$PROFILE_JSON")"
+}
+
+merlin_update() {
+  local client=$1 candidates chosen peer_key endpoint_ip hostname country city load endpoint existing_priv
+  validate_client "$client"; merlin_preflight
+  [[ -n "$(nvram get "${client}_priv")" ]] || die "$client has no private key. Use 'merlin create' first."
+  existing_priv=$(nvram get "${client}_priv")
+  candidates=$(fetch_candidates); (( $(jq 'length' <<<"$candidates") > 0 )) || die 'No matching online NordLynx servers found.'
+  chosen=$(jq -c '.[0]' <<<"$candidates")
+  peer_key=$(jq -er "$server_public_key_jq" <<<"$chosen") || die 'Selected server has no WireGuard public key.'
+  endpoint_ip=$(jq -er '.station' <<<"$chosen") || die 'Selected server has no endpoint IP.'
+  hostname=$(jq -er '.hostname' <<<"$chosen") || die 'Selected server has no hostname.'
+  country=$(jq -r '.locations[0].country.name // "Unknown"' <<<"$chosen")
+  city=$(jq -r '.locations[0].country.city.name // "Unknown"' <<<"$chosen")
+  load=$(jq -r '.load // 0' <<<"$chosen")
+  if [[ "$MERLIN_ENDPOINT_MODE" == hostname ]]; then endpoint=$hostname; else endpoint=$endpoint_ip; fi
+  PROFILE_JSON=$(jq -cn --arg private_key "$existing_priv" --arg peer_key "$peer_key" --arg hostname "$hostname" \
+    --arg endpoint_ip "$endpoint_ip" --arg endpoint "$endpoint" --arg country "$country" --arg city "$city" --argjson load "$load" \
+    '{private_key:$private_key,peer_key:$peer_key,hostname:$hostname,endpoint_ip:$endpoint_ip,endpoint:$endpoint,country:$country,city:$city,load:$load}')
+  confirm_replace "$client"; backup_client "$client"; merlin_write_server_only "$client"
+  apply_client "$client"; verify_client "$client" || true
+  ok "$client updated to $hostname"
+}
+
+prescan_config() {
+  local -a args=("$@")
+  local i
+  for ((i=0; i<${#args[@]}; i++)); do
+    if [[ "${args[i]}" == "--config" ]]; then
+      (( i + 1 < ${#args[@]} )) || die 'Missing value after --config.'
+      CONFIG_FILE=${args[i+1]}; load_config_file "$CONFIG_FILE"; return
+    fi
+  done
+}
+
+parse_common_options() {
+  while (($#)); do
+    case "$1" in
+      --config) CONFIG_FILE=$2; shift 2 ;;
+      --token) ACCESS_TOKEN=$2; shift 2 ;;
+      --token-file) TOKEN_FILE=$2; shift 2 ;;
+      --output-dir) OUTPUT_DIR=$2; shift 2 ;;
+      --country) COUNTRY=$2; shift 2 ;;
+      --city) CITY=$2; shift 2 ;;
+      --server) SERVER=$2; shift 2 ;;
+      --group) GROUP=$2; shift 2 ;;
+      --limit) LIMIT=$2; shift 2 ;;
+      --desc) DESCRIPTION=$2; shift 2 ;;
+      --dns) WG_DNS=$2; shift 2 ;;
+      --keepalive) WG_KEEPALIVE=$2; shift 2 ;;
+      --mtu) WG_MTU=$2; shift 2 ;;
+      --endpoint) MERLIN_ENDPOINT_MODE=$2; shift 2 ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --quiet) QUIET=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -v|--version) printf '%s %s\n' "$APP_NAME" "$VERSION"; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ "$LIMIT" =~ ^[0-9]+$ ]] || die '--limit must be numeric.'
+  [[ "$MERLIN_ENDPOINT_MODE" == ip || "$MERLIN_ENDPOINT_MODE" == hostname ]] || die '--endpoint must be ip or hostname.'
+}
+
+main() {
+  need bash; need curl; need jq; need awk; need mktemp
+  load_config_file "$CONFIG_FILE"
+  prescan_config "$@"
+
+  local command=${1:-help}; shift || true
+  case "$command" in
+    help|-h|--help) usage ;;
+    version|-v|--version) printf '%s %s\n' "$APP_NAME" "$VERSION" ;;
+    countries) parse_common_options "$@"; list_countries ;;
+    servers) parse_common_options "$@"; print_servers ;;
+    config) parse_common_options "$@"; select_profile; write_conf ;;
+    merlin)
+      local sub=${1:-}; shift || true
+      case "$sub" in
+        list) parse_common_options "$@"; merlin_list ;;
+        show)
+          [[ $# -ge 1 ]] || die 'Usage: nordvpn-wg merlin show wgcN'
+          local c=$1; shift; parse_common_options "$@"; merlin_show "$c" ;;
+        create)
+          [[ $# -ge 1 ]] || die 'Usage: nordvpn-wg merlin create wgcN [filters]'
+          local c=$1; shift; parse_common_options "$@"; merlin_create "$c" ;;
+        update)
+          [[ $# -ge 1 ]] || die 'Usage: nordvpn-wg merlin update wgcN [filters]'
+          local c=$1; shift; parse_common_options "$@"; merlin_update "$c" ;;
+        *) die 'Merlin commands: list, show wgcN, create wgcN, update wgcN' ;;
+      esac ;;
+    *) die "Unknown command: $command" ;;
+  esac
+}
+
+main "$@"
