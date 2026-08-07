@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.1.5
+# v0.1.6
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.1.5"
+VERSION="0.1.6"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -120,8 +120,6 @@ api_get() {
 }
 
 sanitize_token() {
-  # Nord access tokens contain no whitespace. Removing it also handles CRLF
-  # and accidental spaces introduced while copying the token to the router.
   printf '%s' "$1" | tr -d '[:space:]'
 }
 
@@ -137,14 +135,19 @@ read_token() {
   printf '%s' "$token"
 }
 
+base64_one_line() {
+  need base64
+  base64 | tr -d '\r\n'
+}
+
 credentials_request() {
   outfile=$1
   token=$(read_token)
   need curl
-  # Do not use -f here: callers need the HTTP status for useful diagnostics.
+  auth=$(printf 'token:%s' "$token" | base64_one_line)
   curl -g -sS --connect-timeout 10 --max-time 30 \
     -o "$outfile" -w '%{http_code}' \
-    -u "token:${token}" \
+    -H "Authorization: Basic $auth" \
     "${NORD_API}/users/services/credentials"
 }
 
