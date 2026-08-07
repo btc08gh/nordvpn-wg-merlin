@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.1.6
+# v0.1.7
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.1.6"
+VERSION="0.1.7"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -120,7 +120,19 @@ api_get() {
 }
 
 sanitize_token() {
-  printf '%s' "$1" | tr -d '[:space:]'
+  # BusyBox/firmware tr implementations may not understand POSIX character
+  # classes in delete sets. Nord tokens are single-line values, so strip only
+  # CR/LF and leave every hexadecimal token character untouched.
+  printf '%s' "$1" | tr -d '\r\n'
+}
+
+validate_token() {
+  token_to_check=$1
+  token_len=$(printf '%s' "$token_to_check" | wc -c | tr -d ' ')
+  [ "$token_len" = "64" ] || die "Nord access token must be exactly 64 hexadecimal characters (found $token_len)."
+  case "$token_to_check" in
+    *[!0-9a-fA-F]*) die "Nord access token contains non-hexadecimal characters." ;;
+  esac
 }
 
 read_token() {
@@ -128,10 +140,10 @@ read_token() {
     token=$(sanitize_token "$ACCESS_TOKEN")
   else
     [ -r "$TOKEN_FILE" ] || die "No Nord access token. Create $TOKEN_FILE or use --token."
-    token=$(sed -n '1p' "$TOKEN_FILE" | tr -d '[:space:]')
+    token=$(sed -n '1p' "$TOKEN_FILE" | tr -d '\r\n')
   fi
   [ -n "$token" ] || die "Nord access token is empty."
-  [ "${#token}" -ge 20 ] || die "Nord access token looks too short; check $TOKEN_FILE."
+  validate_token "$token"
   printf '%s' "$token"
 }
 
