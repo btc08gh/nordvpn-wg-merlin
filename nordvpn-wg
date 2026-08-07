@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.1.2
+# v0.1.3
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.1.2"
+VERSION="0.1.3"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -143,7 +143,16 @@ normalize() {
 
 resolve_country_id() {
   req=$(normalize "$1")
-  api_get "${NORD_API}/servers/countries" | jq -er --arg key "$req" '[.[] | select((((.code // "")|ascii_downcase)==$key) or (((.name // "")|ascii_downcase|gsub("[ _-]+";"_"))==$key))][0].id'
+  countries=$(api_get "${NORD_API}/servers/countries") || return 1
+
+  # Entware jq may be built without Oniguruma, so avoid gsub/sub/match/test.
+  # Emit simple TSV and perform normalization with POSIX shell tools instead.
+  printf '%s' "$countries" | jq -r '.[] | [.id, (.code // ""), (.name // "")] | @tsv' |
+  while IFS="$(printf '\t')" read -r id code name; do
+    [ "$(normalize "$code")" = "$req" ] || [ "$(normalize "$name")" = "$req" ] || continue
+    printf '%s\n' "$id"
+    break
+  done
 }
 
 fetch_candidates() {
@@ -158,6 +167,7 @@ fetch_candidates() {
   url="${NORD_API}/servers/recommendations?filters[servers.status]=online&filters[servers_technologies][identifier]=wireguard_udp&limit=100"
   if [ -n "$COUNTRY" ]; then
     cid=$(resolve_country_id "$COUNTRY") || die "Unknown NordVPN country: $COUNTRY"
+    [ -n "$cid" ] || die "Unknown NordVPN country: $COUNTRY"
     url="${url}&filters[country_id]=${cid}"
   fi
   api_get "$url" | jq -c --arg city "$CITY" --arg group "$GROUP" '[.[]
