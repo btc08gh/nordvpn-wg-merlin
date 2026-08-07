@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.1.4
+# v0.1.5
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.1.4"
+VERSION="0.1.5"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -46,19 +46,12 @@ LIMIT="10"
 DRY_RUN="0"
 ASSUME_YES="0"
 ACCESS_TOKEN="${NORDVPN_TOKEN:-}"
-TMPFILES=""
 
-cleanup() {
-  for f in $TMPFILES; do rm -f "$f" 2>/dev/null || true; done
-}
+TMPDIR_RUN="/tmp/nordvpn-wg.$$"
+mkdir -p "$TMPDIR_RUN"
+cleanup() { rm -rf "$TMPDIR_RUN" 2>/dev/null || true; }
 trap cleanup EXIT HUP INT TERM
-
-tmpfile() {
-  f="/tmp/nordvpn-wg.$$.$1"
-  : > "$f"
-  TMPFILES="$TMPFILES $f"
-  printf '%s' "$f"
-}
+tmpfile() { printf '%s/%s' "$TMPDIR_RUN" "$1"; }
 
 usage() {
   cat <<EOF
@@ -70,6 +63,7 @@ Runs under the stock Merlin /bin/sh. Entware curl and jq are required.
 Usage:
   $APP_NAME countries
   $APP_NAME servers [--country NAME|CODE] [--city NAME] [--limit N]
+  $APP_NAME auth-test
   $APP_NAME merlin list
   $APP_NAME merlin show wgcN
   $APP_NAME merlin create wgcN [filters] [--dry-run]
@@ -125,19 +119,60 @@ api_get() {
   curl -g -fsSL --connect-timeout 10 --max-time 30 "$1"
 }
 
+sanitize_token() {
+  # Nord access tokens contain no whitespace. Removing it also handles CRLF
+  # and accidental spaces introduced while copying the token to the router.
+  printf '%s' "$1" | tr -d '[:space:]'
+}
+
 read_token() {
-  if [ -n "$ACCESS_TOKEN" ]; then printf '%s' "$ACCESS_TOKEN"; return; fi
-  [ -r "$TOKEN_FILE" ] || die "No Nord access token. Create $TOKEN_FILE or use --token."
-  token=$(sed -n '1p' "$TOKEN_FILE")
-  [ -n "$token" ] || die "Token file is empty: $TOKEN_FILE"
+  if [ -n "$ACCESS_TOKEN" ]; then
+    token=$(sanitize_token "$ACCESS_TOKEN")
+  else
+    [ -r "$TOKEN_FILE" ] || die "No Nord access token. Create $TOKEN_FILE or use --token."
+    token=$(sed -n '1p' "$TOKEN_FILE" | tr -d '[:space:]')
+  fi
+  [ -n "$token" ] || die "Nord access token is empty."
+  [ "${#token}" -ge 20 ] || die "Nord access token looks too short; check $TOKEN_FILE."
   printf '%s' "$token"
 }
 
-fetch_private_key() {
-  need curl; need jq
+credentials_request() {
+  outfile=$1
   token=$(read_token)
-  f=$(tmpfile creds)
-  curl -g -fsSL --connect-timeout 10 --max-time 30 -u "token:${token}" "${NORD_API}/users/services/credentials" > "$f" || die "Unable to retrieve Nord service credentials."
+  need curl
+  # Do not use -f here: callers need the HTTP status for useful diagnostics.
+  curl -g -sS --connect-timeout 10 --max-time 30 \
+    -o "$outfile" -w '%{http_code}' \
+    -u "token:${token}" \
+    "${NORD_API}/users/services/credentials"
+}
+
+auth_test() {
+  need jq
+  f=$(tmpfile credentials.json)
+  status=$(credentials_request "$f") || die "Unable to contact Nord service-credentials API."
+  case "$status" in
+    200)
+      if jq -e '.nordlynx_private_key | select(type=="string" and length>20)' "$f" >/dev/null 2>&1; then
+        ok "Nord access token accepted; NordLynx credentials are available."
+      else
+        die "Nord accepted the request but no NordLynx private key was returned."
+      fi
+      ;;
+    401) die "Nord rejected the access token (HTTP 401). Generate/verify a NordVPN access token under Nord Account > NordVPN > Advanced settings." ;;
+    *) die "Nord service-credentials API returned HTTP $status." ;;
+  esac
+}
+
+fetch_private_key() {
+  need jq
+  f=$(tmpfile credentials.json)
+  status=$(credentials_request "$f") || die "Unable to contact Nord service-credentials API."
+  [ "$status" = "200" ] || {
+    [ "$status" = "401" ] && die "Nord rejected the access token (HTTP 401). Run '$APP_NAME auth-test' after checking the token."
+    die "Nord service-credentials API returned HTTP $status."
+  }
   jq -er '.nordlynx_private_key | select(type=="string" and length>20)' "$f" || die "Nord API did not return a NordLynx private key."
 }
 
@@ -145,7 +180,7 @@ normalize() { printf '%s' "$1" | tr '[:upper:] -' '[:lower:]__'; }
 
 resolve_country_id() {
   req=$(normalize "$1")
-  f=$(tmpfile countries)
+  f=$(tmpfile countries.json)
   api_get "${NORD_API}/servers/countries" > "$f" || return 1
   jq -r '.[] | [.id, (.code // ""), (.name // "")] | @tsv' "$f" |
   while IFS="$(printf '\t')" read -r id code name; do
@@ -158,7 +193,7 @@ resolve_country_id() {
 fetch_candidates_to_file() {
   out=$1
   need jq
-  raw=$(tmpfile raw)
+  raw=$(tmpfile servers-raw.json)
   if [ -n "$SERVER" ]; then
     host="$SERVER"; case "$host" in *.nordvpn.com) ;; *) host="${host}.nordvpn.com" ;; esac
     api_get "${NORD_API}/servers?limit=10000" > "$raw" || die "Unable to download Nord server catalogue."
@@ -184,7 +219,7 @@ list_countries() {
 }
 
 print_servers() {
-  f=$(tmpfile candidates)
+  f=$(tmpfile candidates.json)
   fetch_candidates_to_file "$f"
   printf '%-22s %-16s %-24s %5s  %s\n' HOSTNAME COUNTRY CITY LOAD IP
   jq -r --argjson limit "$LIMIT" '.[:$limit][] | [(.hostname // "-"),(.locations[0].country.name // "-"),(.locations[0].country.city.name // "-"),((.load // 0)|tostring),(.station // "-")] | @tsv' "$f" |
@@ -207,11 +242,11 @@ merlin_list() {
 merlin_show() { validate_client "$1"; merlin_preflight; nvram show 2>/dev/null | grep "^${1}_" | sort; }
 
 select_profile() {
-  f=$(tmpfile candidates)
+  f=$(tmpfile candidates.json)
   fetch_candidates_to_file "$f"
   count=$(jq 'length' "$f")
   [ "$count" -gt 0 ] || die "No matching online NordLynx servers found."
-  chosen=$(tmpfile chosen)
+  chosen=$(tmpfile chosen.json)
   jq -c '.[0]' "$f" > "$chosen"
   private_key=$(fetch_private_key)
   peer_key=$(jq -er 'first(.technologies[]? | select(.identifier=="wireguard_udp") | .metadata[]? | select((.name // "")=="public_key") | .value)' "$chosen") || die "Selected server has no WireGuard public key."
@@ -258,4 +293,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$cmd" in
-  -h|--help|help) usage ;; -v|--version|version) printf '%s %s\n' "$APP_NAME" "$VERSION" ;; countries) list_countries ;; servers) print_servers ;; merlin) case "$subcmd" in list) merlin_list ;; show) merlin_show "$client" ;; create) merlin_create "$client" ;; update) merlin_update "$client" ;; *) die "Unknown merlin subcommand: $subcmd" ;; esac ;; *) die "Unknown command: $cmd" ;; esac
+  -h|--help|help) usage ;;
+  -v|--version|version) printf '%s %s\n' "$APP_NAME" "$VERSION" ;;
+  countries) list_countries ;;
+  servers) print_servers ;;
+  auth-test) auth_test ;;
+  merlin) case "$subcmd" in list) merlin_list ;; show) merlin_show "$client" ;; create) merlin_create "$client" ;; update) merlin_update "$client" ;; *) die "Unknown merlin subcommand: $subcmd" ;; esac ;;
+  *) die "Unknown command: $cmd" ;;
+esac
