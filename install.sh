@@ -12,17 +12,21 @@ STATE_DIR="$PREFIX/var/lib/nordvpn-wg"
   exit 1
 }
 
+# Entware is a hard requirement for this project. Check the canonical Entware
+# locations directly rather than relying on BusyBox shell command discovery.
+[ -x /opt/bin/curl ] || {
+  echo "Missing Entware curl at /opt/bin/curl. Install with: opkg install curl" >&2
+  exit 1
+}
+
+[ -x /opt/bin/jq ] || {
+  echo "Missing Entware jq at /opt/bin/jq. Install with: opkg install jq" >&2
+  exit 1
+}
+
 # The tool itself runs under Asuswrt-Merlin's stock /bin/sh (BusyBox ash).
-# Entware is required for utilities, not for Bash.
 PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
-
-for cmd in curl jq; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "Missing $cmd. Install prerequisites with: opkg install curl jq" >&2
-    exit 1
-  }
-done
 
 mkdir -p "$PREFIX/sbin" "$TOKEN_DIR" "$STATE_DIR/backups" "$STATE_DIR/profiles"
 cp ./nordvpn-wg "$BIN"
