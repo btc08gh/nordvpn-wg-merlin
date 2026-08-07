@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.2.1
+# v0.3.0
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.2.1"
+VERSION="0.3.0"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -17,7 +17,6 @@ DEFAULT_STATE_DIR="/opt/var/lib/nordvpn-wg"
 CONFIG_FILE="$DEFAULT_CONFIG"
 TOKEN_FILE="$DEFAULT_TOKEN_FILE"
 STATE_DIR="$DEFAULT_STATE_DIR"
-OUTPUT_DIR="${PWD}"
 
 WG_ADDRESS="10.5.0.2/32"
 WG_DNS="192.168.50.1"
@@ -37,6 +36,7 @@ BACKUP_BEFORE_WRITE="1"
 NVRAM_COMMIT="1"
 VERIFY_HANDSHAKE="1"
 VERIFY_TIMEOUT="15"
+IP_TEST_URL="https://api.ipify.org"
 
 COUNTRY=""
 CITY=""
@@ -72,9 +72,12 @@ Usage:
   $APP_NAME merlin list
   $APP_NAME merlin show wgcN [--show-secrets]
   $APP_NAME merlin status wgcN
+  $APP_NAME merlin ip wgcN
+  $APP_NAME merlin verify wgcN
   $APP_NAME merlin diff wgcN [filters]
   $APP_NAME merlin create wgcN [filters] [--dry-run] [--apply]
   $APP_NAME merlin update wgcN [filters] [--dry-run] [--apply]
+  $APP_NAME merlin refresh wgcN [filters] [--dry-run] [--apply]
 
   $APP_NAME merlin apply wgcN
   $APP_NAME merlin restart wgcN
@@ -101,7 +104,7 @@ Options:
   --mtu N
   --endpoint ip|hostname
   --dry-run
-  --show-secrets            Show private/PSK values where output is normally redacted
+  --show-secrets
   --apply                   Explicitly activate/restart after a write or restore
   --no-commit               Change runtime NVRAM only; do not nvram commit
   --yes, -y
@@ -109,9 +112,9 @@ Options:
   -v, --version
 
 Safety defaults:
-  create/update/enable/disable/restore write NVRAM but DO NOT apply unless --apply
-  create/update/restore back up the current slot before changing it
-  private keys and PSKs are redacted from show/diff/dry-run unless --show-secrets
+  create/update/refresh/enable/disable/restore DO NOT apply unless --apply
+  create/update/refresh/restore back up the current slot before changing it
+  private keys and PSKs are redacted unless --show-secrets
 EOF
 }
 
@@ -138,8 +141,6 @@ need() { have_cmd "$1" || die "Required command not found: $1"; }
 load_config() {
   [ -f "$DEFAULT_CONFIG" ] && . "$DEFAULT_CONFIG"
   [ "$CONFIG_FILE" = "$DEFAULT_CONFIG" ] || { [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"; }
-  # AUTO_APPLY existed in pre-0.2 configs. It is intentionally ignored now:
-  # applying is always an explicit CLI action via --apply or `merlin apply`.
   APPLY_REQUESTED="0"
 }
 
@@ -148,22 +149,17 @@ api_get() {
   curl -g -fsSL --connect-timeout 10 --max-time 30 "$1"
 }
 
-sanitize_token() {
-  printf '%s' "$1" | tr -d '\r\n'
-}
+sanitize_token() { printf '%s' "$1" | tr -d '\r\n'; }
 
 validate_token() {
   token_to_check=$1
   token_len=$(printf '%s' "$token_to_check" | wc -c | tr -d ' ')
   [ "$token_len" = "64" ] || die "Nord access token must be exactly 64 hexadecimal characters (found $token_len)."
-  case "$token_to_check" in
-    *[!0-9a-fA-F]*) die "Nord access token contains non-hexadecimal characters." ;;
-  esac
+  case "$token_to_check" in *[!0-9a-fA-F]*) die "Nord access token contains non-hexadecimal characters." ;; esac
 }
 
 read_token() {
-  if [ -n "$ACCESS_TOKEN" ]; then
-    token=$(sanitize_token "$ACCESS_TOKEN")
+  if [ -n "$ACCESS_TOKEN" ]; then token=$(sanitize_token "$ACCESS_TOKEN")
   else
     [ -r "$TOKEN_FILE" ] || die "No Nord access token. Create $TOKEN_FILE or use --token."
     token=$(sed -n '1p' "$TOKEN_FILE" | tr -d '\r\n')
@@ -173,10 +169,7 @@ read_token() {
   printf '%s' "$token"
 }
 
-base64_one_line() {
-  need base64
-  base64 | tr -d '\r\n'
-}
+base64_one_line() { need base64; base64 | tr -d '\r\n'; }
 
 credentials_request() {
   outfile=$1
@@ -191,14 +184,8 @@ auth_test() {
   f=$(tmpfile credentials.json)
   status=$(credentials_request "$f") || die "Unable to contact Nord service-credentials API."
   case "$status" in
-    200)
-      if jq -e '.nordlynx_private_key | select(type=="string" and length>20)' "$f" >/dev/null 2>&1; then
-        ok "Nord access token accepted; NordLynx credentials are available."
-      else
-        die "Nord accepted the request but no NordLynx private key was returned."
-      fi
-      ;;
-    401) die "Nord rejected the access token (HTTP 401). Generate/verify a NordVPN access token under Nord Account > NordVPN > Advanced settings." ;;
+    200) jq -e '.nordlynx_private_key | select(type=="string" and length>20)' "$f" >/dev/null 2>&1 && ok "Nord access token accepted; NordLynx credentials are available." || die "Nord accepted the request but no NordLynx private key was returned." ;;
+    401) die "Nord rejected the access token (HTTP 401)." ;;
     *) die "Nord service-credentials API returned HTTP $status." ;;
   esac
 }
@@ -207,10 +194,7 @@ fetch_private_key() {
   need jq
   f=$(tmpfile credentials.json)
   status=$(credentials_request "$f") || die "Unable to contact Nord service-credentials API."
-  [ "$status" = "200" ] || {
-    [ "$status" = "401" ] && die "Nord rejected the access token (HTTP 401). Run '$APP_NAME auth-test' after checking the token."
-    die "Nord service-credentials API returned HTTP $status."
-  }
+  [ "$status" = "200" ] || die "Nord service-credentials API returned HTTP $status."
   jq -er '.nordlynx_private_key | select(type=="string" and length>20)' "$f" || die "Nord API did not return a NordLynx private key."
 }
 
@@ -223,8 +207,7 @@ resolve_country_id() {
   jq -r '.[] | [.id, (.code // ""), (.name // "")] | @tsv' "$f" |
   while IFS="$(printf '\t')" read -r id code name; do
     [ "$(normalize "$code")" = "$req" ] || [ "$(normalize "$name")" = "$req" ] || continue
-    printf '%s\n' "$id"
-    break
+    printf '%s\n' "$id"; break
   done
 }
 
@@ -233,8 +216,7 @@ fetch_candidates_to_file() {
   need jq
   raw=$(tmpfile servers-raw.json)
   if [ -n "$SERVER" ]; then
-    host="$SERVER"
-    case "$host" in *.nordvpn.com) ;; *) host="${host}.nordvpn.com" ;; esac
+    host="$SERVER"; case "$host" in *.nordvpn.com) ;; *) host="${host}.nordvpn.com" ;; esac
     api_get "${NORD_API}/servers?limit=10000" > "$raw" || die "Unable to download Nord server catalogue."
     jq -c --arg h "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" '[.[] | select(((.hostname // "")|ascii_downcase)==$h) | select(any(.technologies[]?; .identifier=="wireguard_udp"))]' "$raw" > "$out"
     return
@@ -252,36 +234,25 @@ fetch_candidates_to_file() {
     | select(($group=="") or any(.groups[]?; (((.identifier // "")|ascii_downcase)==($group|ascii_downcase)) or (((.title // "")|ascii_downcase)==($group|ascii_downcase))))]' "$raw" > "$out"
 }
 
-list_countries() {
-  need jq
-  api_get "${NORD_API}/servers/countries" | jq -r '.[] | [.code,.name] | @tsv' | sort -k2
-}
+list_countries() { need jq; api_get "${NORD_API}/servers/countries" | jq -r '.[] | [.code,.name] | @tsv' | sort -k2; }
 
 print_servers() {
-  f=$(tmpfile candidates.json)
-  fetch_candidates_to_file "$f"
+  f=$(tmpfile candidates.json); fetch_candidates_to_file "$f"
   printf '%-22s %-16s %-24s %5s  %s\n' HOSTNAME COUNTRY CITY LOAD IP
   jq -r --argjson limit "$LIMIT" '.[:$limit][] | [(.hostname // "-"),(.locations[0].country.name // "-"),(.locations[0].country.city.name // "-"),((.load // 0)|tostring),(.station // "-")] | @tsv' "$f" |
     awk -F '\t' '{printf "%-22s %-16s %-24s %4s%%  %s\n",$1,$2,$3,$4,$5}'
 }
 
-validate_client() {
-  case "$1" in wgc1|wgc2|wgc3|wgc4|wgc5) ;; *) die "Merlin client must be wgc1 through wgc5." ;; esac
-}
+validate_client() { case "$1" in wgc1|wgc2|wgc3|wgc4|wgc5) ;; *) die "Merlin client must be wgc1 through wgc5." ;; esac; }
 
 merlin_preflight() {
-  need nvram
-  need wg
-  need service
+  need nvram; need wg; need service
   [ -n "$(nvram get productid 2>/dev/null || true)" ] || die "This does not appear to be an Asuswrt-Merlin router."
 }
 
 redact_value() {
-  redact_key=$1
-  redact_val=$2
-  if [ "$SHOW_SECRETS" != "1" ]; then
-    case "$redact_key" in *_priv|*_psk) [ -n "$redact_val" ] && { printf '<redacted>'; return; } ;; esac
-  fi
+  redact_key=$1; redact_val=$2
+  if [ "$SHOW_SECRETS" != "1" ]; then case "$redact_key" in *_priv|*_psk) [ -n "$redact_val" ] && { printf '<redacted>'; return; } ;; esac; fi
   printf '%s' "$redact_val"
 }
 
@@ -289,391 +260,225 @@ merlin_list() {
   merlin_preflight
   printf '%-5s %-7s %-24s %-24s %s\n' SLOT ENABLED DESCRIPTION ENDPOINT PUBLIC_IP
   for i in 1 2 3 4 5; do
-    c="wgc$i"
-    desc=$(nvram get "${c}_desc")
-    enabled=$(nvram get "${c}_enable")
-    ep=$(nvram get "${c}_ep_addr")
-    rip=$(nvram get "${c}_rip")
+    c="wgc$i"; desc=$(nvram get "${c}_desc"); enabled=$(nvram get "${c}_enable"); ep=$(nvram get "${c}_ep_addr"); rip=$(nvram get "${c}_rip")
     [ -n "${desc}${ep}${enabled}" ] || continue
     printf '%-5s %-7s %-24.24s %-24.24s %s\n' "$c" "${enabled:-0}" "${desc:--}" "${ep:--}" "${rip:--}"
   done
 }
 
 merlin_show() {
-  show_client=$1
-  validate_client "$show_client"
-  merlin_preflight
+  show_client=$1; validate_client "$show_client"; merlin_preflight
   nvram show 2>/dev/null | grep "^${show_client}_" | sort | while IFS='=' read -r show_key show_val; do
     printf '%s=%s\n' "$show_key" "$(redact_value "$show_key" "$show_val")"
   done
 }
 
 human_bytes() {
-  hb=$1
-  awk -v b="$hb" 'BEGIN {
-    if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
-    else if (b >= 1048576) printf "%.2f MiB", b/1048576;
-    else if (b >= 1024) printf "%.2f KiB", b/1024;
-    else printf "%d B", b;
-  }'
+  awk -v b="$1" 'BEGIN { if (b>=1073741824) printf "%.2f GiB",b/1073741824; else if (b>=1048576) printf "%.2f MiB",b/1048576; else if (b>=1024) printf "%.2f KiB",b/1024; else printf "%d B",b; }'
 }
 
-handshake_epoch() {
-  hs_c=$1
-  wg show "$hs_c" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}'
-}
+handshake_epoch() { wg show "$1" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}'; }
 
 merlin_status() {
-  status_c=$1
-  validate_client "$status_c"
-  merlin_preflight
-  desc=$(nvram get "${status_c}_desc")
-  enabled=$(nvram get "${status_c}_enable")
-  configured_endpoint=$(nvram get "${status_c}_ep_addr")
-  configured_port=$(nvram get "${status_c}_ep_port")
-  rip=$(nvram get "${status_c}_rip")
-
+  status_c=$1; validate_client "$status_c"; merlin_preflight
+  desc=$(nvram get "${status_c}_desc"); enabled=$(nvram get "${status_c}_enable"); configured_endpoint=$(nvram get "${status_c}_ep_addr"); configured_port=$(nvram get "${status_c}_ep_port"); rip=$(nvram get "${status_c}_rip")
   printf 'Client:              %s\n' "$status_c"
   printf 'Description:         %s\n' "${desc:--}"
   printf 'NVRAM enabled:       %s\n' "${enabled:-0}"
   printf 'Configured endpoint: %s:%s\n' "${configured_endpoint:--}" "${configured_port:--}"
-  printf 'Cached public IP:    %s\n' "${rip:--}"
-
-  if ! wg show "$status_c" >/dev/null 2>&1; then
-    printf 'Interface:           down\n'
-    printf 'Handshake:           none\n'
-    return 1
-  fi
-
+  printf 'Merlin cached IP:    %s\n' "${rip:--}"
+  if ! wg show "$status_c" >/dev/null 2>&1; then printf 'Interface:           down\nHandshake:           none\n'; return 1; fi
   live_endpoint=$(wg show "$status_c" endpoints 2>/dev/null | awk 'NR==1 {print $2}')
-  hs=$(handshake_epoch "$status_c")
-  transfer=$(wg show "$status_c" transfer 2>/dev/null | awk 'NR==1 {print $2 " " $3}')
-  rx=$(printf '%s' "$transfer" | awk '{print $1}')
-  tx=$(printf '%s' "$transfer" | awk '{print $2}')
-  [ -n "$rx" ] || rx=0
-  [ -n "$tx" ] || tx=0
+  hs=$(handshake_epoch "$status_c"); transfer=$(wg show "$status_c" transfer 2>/dev/null | awk 'NR==1 {print $2 " " $3}')
+  rx=$(printf '%s' "$transfer" | awk '{print $1}'); tx=$(printf '%s' "$transfer" | awk '{print $2}'); [ -n "$rx" ] || rx=0; [ -n "$tx" ] || tx=0
+  printf 'Interface:           up\nLive endpoint:       %s\n' "${live_endpoint:--}"
+  if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then now=$(date +%s); age=$((now-hs)); [ "$age" -lt 0 ] && age=0; printf 'Handshake:           %s seconds ago\n' "$age"; else printf 'Handshake:           never\n'; fi
+  printf 'Transfer RX:         %s\nTransfer TX:         %s\n' "$(human_bytes "$rx")" "$(human_bytes "$tx")"
+}
 
-  printf 'Interface:           up\n'
-  printf 'Live endpoint:       %s\n' "${live_endpoint:--}"
-  if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then
-    now=$(date +%s)
-    age=$((now - hs))
-    [ "$age" -lt 0 ] && age=0
-    printf 'Handshake:           %s seconds ago\n' "$age"
-  else
-    printf 'Handshake:           never\n'
+exit_ip() {
+  ip_c=$1
+  validate_client "$ip_c"; merlin_preflight; need curl
+  wg show "$ip_c" >/dev/null 2>&1 || return 1
+  ip=$(curl -4 -g -fsS --interface "$ip_c" --connect-timeout 5 --max-time 12 "$IP_TEST_URL" 2>/dev/null | tr -d '\r\n ' || true)
+  case "$ip" in
+    ''|*[!0-9.]*) return 1 ;;
+    *) printf '%s\n' "$ip" ;;
+  esac
+}
+
+merlin_ip() {
+  c=$1
+  validate_client "$c"; merlin_preflight
+  live=$(exit_ip "$c") || die "Unable to determine exit IP through $c."
+  printf 'Client:  %s\nExit IP: %s\n' "$c" "$live"
+}
+
+merlin_verify() {
+  c=$1
+  validate_client "$c"; merlin_preflight
+  failed=0
+  printf 'Verifying %s\n\n' "$c"
+  enabled=$(nvram get "${c}_enable")
+  if [ "$enabled" = "1" ]; then printf '[+] NVRAM enabled\n'; else printf '[x] NVRAM disabled\n'; failed=1; fi
+  if wg show "$c" >/dev/null 2>&1; then printf '[+] WireGuard interface is up\n'; else printf '[x] WireGuard interface is down\n'; failed=1; fi
+  if [ "$failed" -eq 0 ]; then
+    hs=$(handshake_epoch "$c")
+    if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then now=$(date +%s); age=$((now-hs)); [ "$age" -lt 0 ] && age=0; printf '[+] Handshake present (%ss ago)\n' "$age"; else printf '[x] No handshake\n'; failed=1; fi
+    configured="$(nvram get "${c}_ep_addr"):$(nvram get "${c}_ep_port")"
+    live=$(wg show "$c" endpoints 2>/dev/null | awk 'NR==1 {print $2}')
+    if [ "$configured" = "$live" ]; then printf '[+] Live endpoint matches configuration (%s)\n' "$live"; else printf '[!] Live endpoint differs: configured=%s live=%s\n' "$configured" "${live:--}"; fi
+    routed_ip=$(exit_ip "$c" || true)
+    if [ -n "$routed_ip" ]; then printf '[+] Routed Internet test succeeded\n[+] Exit IP: %s\n' "$routed_ip"; else printf '[x] Routed Internet test failed through %s\n' "$c"; failed=1; fi
   fi
-  printf 'Transfer RX:         %s\n' "$(human_bytes "$rx")"
-  printf 'Transfer TX:         %s\n' "$(human_bytes "$tx")"
+  printf '\n'
+  if [ "$failed" -eq 0 ]; then ok "Result: HEALTHY"; return 0; else die "Result: FAILED"; fi
 }
 
 verify_handshake() {
-  verify_c=$1
-  before_hs=${2:-0}
-  [ "$VERIFY_HANDSHAKE" = "1" ] || return 0
-  timeout=$VERIFY_TIMEOUT
-  case "$timeout" in ''|*[!0-9]*) timeout=15 ;; esac
+  verify_c=$1; before_hs=${2:-0}; [ "$VERIFY_HANDSHAKE" = "1" ] || return 0
+  timeout=$VERIFY_TIMEOUT; case "$timeout" in ''|*[!0-9]*) timeout=15 ;; esac
   waited=0
   while [ "$waited" -lt "$timeout" ]; do
     if wg show "$verify_c" >/dev/null 2>&1; then
       after_hs=$(handshake_epoch "$verify_c")
-      if [ -n "$after_hs" ] && [ "$after_hs" -gt 0 ] 2>/dev/null; then
-        if [ "$before_hs" -eq 0 ] 2>/dev/null || [ "$after_hs" -gt "$before_hs" ] 2>/dev/null; then
-          now=$(date +%s)
-          age=$((now - after_hs))
-          [ "$age" -lt 0 ] && age=0
-          ok "$verify_c handshake established (${age}s ago)."
-          return 0
-        fi
+      if [ -n "$after_hs" ] && [ "$after_hs" -gt 0 ] 2>/dev/null && { [ "$before_hs" -eq 0 ] 2>/dev/null || [ "$after_hs" -gt "$before_hs" ] 2>/dev/null; }; then
+        now=$(date +%s); age=$((now-after_hs)); [ "$age" -lt 0 ] && age=0; ok "$verify_c handshake established (${age}s ago)."; return 0
       fi
     fi
-    sleep 1
-    waited=$((waited + 1))
+    sleep 1; waited=$((waited+1))
   done
-  warn "$verify_c restarted but no new handshake was observed within ${timeout}s. Run '$APP_NAME merlin status $verify_c'."
-  return 1
+  warn "$verify_c restarted but no new handshake was observed within ${timeout}s."; return 1
 }
 
 select_profile() {
-  f=$(tmpfile candidates.json)
-  fetch_candidates_to_file "$f"
-  count=$(jq 'length' "$f")
-  [ "$count" -gt 0 ] || die "No matching online NordLynx servers found."
-  chosen=$(tmpfile chosen.json)
-  jq -c '.[0]' "$f" > "$chosen"
+  f=$(tmpfile candidates.json); fetch_candidates_to_file "$f"; count=$(jq 'length' "$f"); [ "$count" -gt 0 ] || die "No matching online NordLynx servers found."
+  chosen=$(tmpfile chosen.json); jq -c '.[0]' "$f" > "$chosen"
   private_key=$(fetch_private_key)
   peer_key=$(jq -er 'first(.technologies[]? | select(.identifier=="wireguard_udp") | .metadata[]? | select((.name // "")=="public_key") | .value)' "$chosen") || die "Selected server has no WireGuard public key."
   endpoint_ip=$(jq -er '.station' "$chosen") || die "Selected server has no endpoint IP."
   hostname=$(jq -er '.hostname' "$chosen") || die "Selected server has no hostname."
-  country_name=$(jq -r '.locations[0].country.name // "Unknown"' "$chosen")
-  city_name=$(jq -r '.locations[0].country.city.name // "Unknown"' "$chosen")
+  country_name=$(jq -r '.locations[0].country.name // "Unknown"' "$chosen"); country_code=$(jq -r '.locations[0].country.code // ""' "$chosen"); city_name=$(jq -r '.locations[0].country.city.name // "Unknown"' "$chosen")
   case "$MERLIN_ENDPOINT_MODE" in hostname) endpoint="$hostname" ;; *) endpoint="$endpoint_ip" ;; esac
 }
 
-profile_desc() {
-  if [ -n "$DESCRIPTION" ]; then printf '%s' "$DESCRIPTION"
-  elif [ "$city_name" != "Unknown" ]; then printf 'Nord %s' "$city_name"
-  else printf 'Nord %s' "$country_name"
+profile_desc() { if [ -n "$DESCRIPTION" ]; then printf '%s' "$DESCRIPTION"; elif [ "$city_name" != "Unknown" ]; then printf 'Nord %s' "$city_name"; else printf 'Nord %s' "$country_name"; fi; }
+
+metadata_file() { printf '%s/slots/%s.json' "$STATE_DIR" "$1"; }
+
+save_metadata() {
+  meta_c=$1; need jq; mkdir -p "$STATE_DIR/slots"
+  meta_file=$(metadata_file "$meta_c")
+  meta_country=$COUNTRY; [ -n "$meta_country" ] || meta_country=$country_code; [ -n "$meta_country" ] || meta_country=$country_name
+  meta_city=$CITY; [ -n "$meta_city" ] || [ "$city_name" = "Unknown" ] || meta_city=$city_name
+  meta_group=$GROUP
+  meta_desc=$(profile_desc)
+  jq -n --arg slot "$meta_c" --arg provider "NordVPN" --arg country "$meta_country" --arg city "$meta_city" --arg group "$meta_group" --arg server "$hostname" --arg description "$meta_desc" --arg updated "$(date '+%Y-%m-%dT%H:%M:%S%z')" '{slot:$slot,provider:$provider,country:$country,city:$city,group:$group,last_server:$server,description:$description,updated_at:$updated}' > "$meta_file"
+  chmod 600 "$meta_file"
+  log "Metadata: $meta_file"
+}
+
+load_refresh_metadata() {
+  c=$1; need jq
+  meta_file=$(metadata_file "$c")
+  if [ -r "$meta_file" ]; then
+    [ -n "$COUNTRY" ] || COUNTRY=$(jq -r '.country // ""' "$meta_file")
+    [ -n "$CITY" ] || CITY=$(jq -r '.city // ""' "$meta_file")
+    [ -n "$GROUP" ] || GROUP=$(jq -r '.group // ""' "$meta_file")
+    [ -n "$DESCRIPTION" ] || DESCRIPTION=$(jq -r '.description // ""' "$meta_file")
   fi
+  [ -n "$COUNTRY$CITY$GROUP" ] || die "No remembered selectors for $c. Seed them once with: $APP_NAME merlin refresh $c --country US --city Dallas"
+  SERVER=""
 }
 
 backup_client_force() {
-  backup_c=$1
-  mkdir -p "$STATE_DIR/backups"
-  backup_file="$STATE_DIR/backups/$backup_c-$(date +%Y%m%d-%H%M%S).nvram"
-  nvram show 2>/dev/null | grep "^${backup_c}_" | sort > "$backup_file" || true
-  chmod 600 "$backup_file"
-  printf '%s\n' "$backup_file"
+  backup_c=$1; mkdir -p "$STATE_DIR/backups"; backup_file="$STATE_DIR/backups/$backup_c-$(date +%Y%m%d-%H%M%S).nvram"
+  nvram show 2>/dev/null | grep "^${backup_c}_" | sort > "$backup_file" || true; chmod 600 "$backup_file"; printf '%s\n' "$backup_file"
 }
+backup_client() { [ "$BACKUP_BEFORE_WRITE" = "1" ] || return 0; backup_path=$(backup_client_force "$1"); log "Backup: $backup_path"; }
+commit_if_requested() { if [ "$NVRAM_COMMIT" = "1" ]; then nvram commit; log "NVRAM committed."; else log "NVRAM commit skipped (--no-commit)."; fi; }
 
-backup_client() {
-  [ "$BACKUP_BEFORE_WRITE" = "1" ] || return 0
-  backup_path=$(backup_client_force "$1")
-  log "Backup: $backup_path"
-}
-
-commit_if_requested() {
-  if [ "$NVRAM_COMMIT" = "1" ]; then
-    nvram commit
-    log "NVRAM committed."
-  else
-    log "NVRAM commit skipped (--no-commit)."
-  fi
-}
-
-nv_set() {
-  key=$1
-  val=$2
-  if [ "$DRY_RUN" = "1" ]; then
-    shown=$(redact_value "$key" "$val")
-    printf '[dry-run] nvram set %s=%s\n' "$key" "$shown"
-  else
-    nvram set "${key}=${val}"
-  fi
-}
-
-confirm_write() {
-  [ "$ASSUME_YES" = "1" ] && return 0
-  printf 'About to modify %s. Continue? [y/N] ' "$1" >&2
-  read ans || true
-  case "$ans" in y|Y|yes|YES) ;; *) die "Cancelled." ;; esac
-}
+nv_set() { key=$1; val=$2; if [ "$DRY_RUN" = "1" ]; then printf '[dry-run] nvram set %s=%s\n' "$key" "$(redact_value "$key" "$val")"; else nvram set "${key}=${val}"; fi; }
+confirm_write() { [ "$ASSUME_YES" = "1" ] && return 0; printf 'About to modify %s. Continue? [y/N] ' "$1" >&2; read ans || true; case "$ans" in y|Y|yes|YES) ;; *) die "Cancelled." ;; esac; }
 
 apply_client() {
-  apply_c=$1
-  validate_client "$apply_c"
-  merlin_preflight
-  before_hs=$(handshake_epoch "$apply_c" || true)
-  [ -n "$before_hs" ] || before_hs=0
-  service "restart_wgc ${apply_c#wgc}"
-  ok "$apply_c restarted."
-  verify_handshake "$apply_c" "$before_hs" || true
+  c=$1; validate_client "$c"; merlin_preflight; before_hs=$(handshake_epoch "$c" || true); [ -n "$before_hs" ] || before_hs=0
+  service "restart_wgc ${c#wgc}"; ok "$c restarted."; verify_handshake "$c" "$before_hs" || true
 }
-
-start_client() {
-  start_c=$1
-  validate_client "$start_c"
-  merlin_preflight
-  before_hs=$(handshake_epoch "$start_c" || true)
-  [ -n "$before_hs" ] || before_hs=0
-  service "start_wgc ${start_c#wgc}"
-  ok "$start_c start requested."
-  verify_handshake "$start_c" "$before_hs" || true
-}
-
-stop_client() {
-  stop_c=$1
-  validate_client "$stop_c"
-  merlin_preflight
-  service "stop_wgc ${stop_c#wgc}"
-  ok "$stop_c stop requested."
-}
+start_client() { c=$1; validate_client "$c"; merlin_preflight; before_hs=$(handshake_epoch "$c" || true); [ -n "$before_hs" ] || before_hs=0; service "start_wgc ${c#wgc}"; ok "$c start requested."; verify_handshake "$c" "$before_hs" || true; }
+stop_client() { c=$1; validate_client "$c"; merlin_preflight; service "stop_wgc ${c#wgc}"; ok "$c stop requested."; }
 
 write_complete_profile() {
-  write_c=$1
-  nv_set "${write_c}_addr" "$WG_ADDRESS"
-  nv_set "${write_c}_alive" "$WG_KEEPALIVE"
-  nv_set "${write_c}_desc" "$(profile_desc)"
-  nv_set "${write_c}_dns" "$WG_DNS"
-  nv_set "${write_c}_enable" "$MERLIN_ENABLE"
-  nv_set "${write_c}_enforce" "$MERLIN_ENFORCE"
-  nv_set "${write_c}_ep_addr" "$endpoint"
-  nv_set "${write_c}_ep_addr_r" "$endpoint_ip"
-  nv_set "${write_c}_ep_port" "$WG_ENDPOINT_PORT"
-  nv_set "${write_c}_fw" "$MERLIN_FIREWALL"
-  nv_set "${write_c}_mtu" "$WG_MTU"
-  nv_set "${write_c}_nat" "$MERLIN_NAT"
-  nv_set "${write_c}_ppub" "$peer_key"
-  nv_set "${write_c}_priv" "$private_key"
-  nv_set "${write_c}_psk" "$MERLIN_PSK"
-  nv_set "${write_c}_tp" "$MERLIN_TP"
-  nv_set "${write_c}_tp_region" "$MERLIN_TP_REGION"
-  nv_set "${write_c}_aips" "$WG_ALLOWED_IPS"
+  c=$1
+  nv_set "${c}_addr" "$WG_ADDRESS"; nv_set "${c}_alive" "$WG_KEEPALIVE"; nv_set "${c}_desc" "$(profile_desc)"; nv_set "${c}_dns" "$WG_DNS"; nv_set "${c}_enable" "$MERLIN_ENABLE"; nv_set "${c}_enforce" "$MERLIN_ENFORCE"; nv_set "${c}_ep_addr" "$endpoint"; nv_set "${c}_ep_addr_r" "$endpoint_ip"; nv_set "${c}_ep_port" "$WG_ENDPOINT_PORT"; nv_set "${c}_fw" "$MERLIN_FIREWALL"; nv_set "${c}_mtu" "$WG_MTU"; nv_set "${c}_nat" "$MERLIN_NAT"; nv_set "${c}_ppub" "$peer_key"; nv_set "${c}_priv" "$private_key"; nv_set "${c}_psk" "$MERLIN_PSK"; nv_set "${c}_tp" "$MERLIN_TP"; nv_set "${c}_tp_region" "$MERLIN_TP_REGION"; nv_set "${c}_aips" "$WG_ALLOWED_IPS"
 }
 
+write_server_fields() { c=$1; nv_set "${c}_desc" "$(profile_desc)"; nv_set "${c}_ep_addr" "$endpoint"; nv_set "${c}_ep_addr_r" "$endpoint_ip"; nv_set "${c}_ep_port" "$WG_ENDPOINT_PORT"; nv_set "${c}_ppub" "$peer_key"; }
+
 merlin_create() {
-  c=$1
-  validate_client "$c"
-  merlin_preflight
-  select_profile
-  confirm_write "$c"
-  [ "$DRY_RUN" = "1" ] || backup_client "$c"
-  write_complete_profile "$c"
+  c=$1; validate_client "$c"; merlin_preflight; select_profile; confirm_write "$c"; [ "$DRY_RUN" = "1" ] || backup_client "$c"; write_complete_profile "$c"
   if [ "$DRY_RUN" = "1" ]; then ok "Dry run complete; NVRAM was not changed."; return; fi
-  commit_if_requested
-  if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"
-  else ok "$c configured for $hostname; not applied. Run '$APP_NAME merlin apply $c' when ready."
-  fi
+  commit_if_requested; save_metadata "$c"; if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"; else ok "$c configured for $hostname; not applied."; fi
 }
 
 merlin_update() {
-  c=$1
-  validate_client "$c"
-  merlin_preflight
-  select_profile
-  confirm_write "$c"
-  [ "$DRY_RUN" = "1" ] || backup_client "$c"
-  nv_set "${c}_desc" "$(profile_desc)"
-  nv_set "${c}_ep_addr" "$endpoint"
-  nv_set "${c}_ep_addr_r" "$endpoint_ip"
-  nv_set "${c}_ep_port" "$WG_ENDPOINT_PORT"
-  nv_set "${c}_ppub" "$peer_key"
+  c=$1; validate_client "$c"; merlin_preflight; select_profile; confirm_write "$c"; [ "$DRY_RUN" = "1" ] || backup_client "$c"; write_server_fields "$c"
   if [ "$DRY_RUN" = "1" ]; then ok "Dry run complete; NVRAM was not changed."; return; fi
-  commit_if_requested
-  if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"
-  else ok "$c updated to $hostname; not applied. Run '$APP_NAME merlin apply $c' when ready."
-  fi
+  commit_if_requested; save_metadata "$c"; if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"; else ok "$c updated to $hostname; not applied."; fi
+}
+
+merlin_refresh() {
+  c=$1; validate_client "$c"; merlin_preflight; load_refresh_metadata "$c"; select_profile
+  printf 'Remembered selection: country=%s city=%s group=%s\n' "${COUNTRY:--}" "${CITY:--}" "${GROUP:--}"
+  printf 'Recommended server: %s (%s)\n' "$hostname" "$endpoint_ip"
+  confirm_write "$c refresh"; [ "$DRY_RUN" = "1" ] || backup_client "$c"; write_server_fields "$c"
+  if [ "$DRY_RUN" = "1" ]; then ok "Dry run complete; NVRAM was not changed."; return; fi
+  commit_if_requested; save_metadata "$c"; if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"; else ok "$c refreshed to $hostname; not applied."; fi
 }
 
 print_diff_field() {
-  diff_key=$1
-  diff_new=$2
-  diff_old=$(nvram get "$diff_key")
-  if [ "$diff_old" = "$diff_new" ]; then
-    diff_status="unchanged"
-  else
-    diff_status="change"
-  fi
-  diff_old_show=$(redact_value "$diff_key" "$diff_old")
-  diff_new_show=$(redact_value "$diff_key" "$diff_new")
-  printf '%-17s %-30.30s %-30.30s %s\n' "${diff_key#*_}" "${diff_old_show:--}" "${diff_new_show:--}" "$diff_status"
+  key=$1; new=$2; old=$(nvram get "$key"); [ "$old" = "$new" ] && status=unchanged || status=change
+  printf '%-17s %-30.30s %-30.30s %s\n' "${key#*_}" "$(redact_value "$key" "$old")" "$(redact_value "$key" "$new")" "$status"
 }
 
 merlin_diff() {
-  c=$1
-  validate_client "$c"
-  merlin_preflight
-  select_profile
+  c=$1; validate_client "$c"; merlin_preflight; select_profile
   printf 'Proposed server: %s (%s, %s)\n\n' "$hostname" "$city_name" "$country_name"
   printf '%-17s %-30s %-30s %s\n' FIELD CURRENT PROPOSED STATUS
   printf '%-17s %-30s %-30s %s\n' '-----------------' '------------------------------' '------------------------------' '--------'
-  print_diff_field "${c}_addr" "$WG_ADDRESS"
-  print_diff_field "${c}_alive" "$WG_KEEPALIVE"
-  print_diff_field "${c}_desc" "$(profile_desc)"
-  print_diff_field "${c}_dns" "$WG_DNS"
-  print_diff_field "${c}_enable" "$MERLIN_ENABLE"
-  print_diff_field "${c}_enforce" "$MERLIN_ENFORCE"
-  print_diff_field "${c}_ep_addr" "$endpoint"
-  print_diff_field "${c}_ep_addr_r" "$endpoint_ip"
-  print_diff_field "${c}_ep_port" "$WG_ENDPOINT_PORT"
-  print_diff_field "${c}_fw" "$MERLIN_FIREWALL"
-  print_diff_field "${c}_mtu" "$WG_MTU"
-  print_diff_field "${c}_nat" "$MERLIN_NAT"
-  print_diff_field "${c}_ppub" "$peer_key"
-  print_diff_field "${c}_priv" "$private_key"
-  print_diff_field "${c}_psk" "$MERLIN_PSK"
-  print_diff_field "${c}_tp" "$MERLIN_TP"
-  print_diff_field "${c}_tp_region" "$MERLIN_TP_REGION"
-  print_diff_field "${c}_aips" "$WG_ALLOWED_IPS"
-  printf '\nNo NVRAM changes were made.\n'
-  printf 'To create exactly this proposal:\n  %s merlin create %s --server %s\n' "$APP_NAME" "$c" "$hostname"
+  print_diff_field "${c}_addr" "$WG_ADDRESS"; print_diff_field "${c}_alive" "$WG_KEEPALIVE"; print_diff_field "${c}_desc" "$(profile_desc)"; print_diff_field "${c}_dns" "$WG_DNS"; print_diff_field "${c}_enable" "$MERLIN_ENABLE"; print_diff_field "${c}_enforce" "$MERLIN_ENFORCE"; print_diff_field "${c}_ep_addr" "$endpoint"; print_diff_field "${c}_ep_addr_r" "$endpoint_ip"; print_diff_field "${c}_ep_port" "$WG_ENDPOINT_PORT"; print_diff_field "${c}_fw" "$MERLIN_FIREWALL"; print_diff_field "${c}_mtu" "$WG_MTU"; print_diff_field "${c}_nat" "$MERLIN_NAT"; print_diff_field "${c}_ppub" "$peer_key"; print_diff_field "${c}_priv" "$private_key"; print_diff_field "${c}_psk" "$MERLIN_PSK"; print_diff_field "${c}_tp" "$MERLIN_TP"; print_diff_field "${c}_tp_region" "$MERLIN_TP_REGION"; print_diff_field "${c}_aips" "$WG_ALLOWED_IPS"
+  printf '\nNo NVRAM changes were made.\nTo create exactly this proposal:\n  %s merlin create %s --server %s\n' "$APP_NAME" "$c" "$hostname"
 }
 
-merlin_backup_cmd() {
-  c=$1
-  validate_client "$c"
-  merlin_preflight
-  backup_path=$(backup_client_force "$c")
-  ok "Backup created: $backup_path"
-}
-
-latest_backup() {
-  latest_c=$1
-  latest_dir="$STATE_DIR/backups"
-  [ -d "$latest_dir" ] || return 1
-  latest_file=$(ls "$latest_dir/$latest_c-"*.nvram 2>/dev/null | sort | tail -n 1 || true)
-  [ -n "$latest_file" ] || return 1
-  printf '%s\n' "$latest_file"
-}
+merlin_backup_cmd() { c=$1; validate_client "$c"; merlin_preflight; ok "Backup created: $(backup_client_force "$c")"; }
+latest_backup() { c=$1; d="$STATE_DIR/backups"; [ -d "$d" ] || return 1; f=$(ls "$d/$c-"*.nvram 2>/dev/null | sort | tail -n 1 || true); [ -n "$f" ] || return 1; printf '%s\n' "$f"; }
 
 restore_client() {
-  c=$1
-  validate_client "$c"
-  merlin_preflight
-  if [ -n "$RESTORE_FILE" ]; then restore_source=$RESTORE_FILE
-  else restore_source=$(latest_backup "$c") || die "No backup found for $c in $STATE_DIR/backups."
-  fi
-  [ -r "$restore_source" ] || die "Backup is not readable: $restore_source"
-  grep -q "^${c}_" "$restore_source" || die "Backup does not contain ${c}_* values: $restore_source"
-  confirm_write "$c from $restore_source"
-  safety_backup=$(backup_client_force "$c")
-  log "Safety backup: $safety_backup"
-  current_keys=$(tmpfile current-keys.txt)
-  nvram show 2>/dev/null | grep "^${c}_" | cut -d= -f1 | sort > "$current_keys" || true
-  while IFS= read -r restore_key; do [ -n "$restore_key" ] && nvram unset "$restore_key"; done < "$current_keys"
-  while IFS='=' read -r restore_key restore_val; do
-    case "$restore_key" in "${c}_"*) nvram set "${restore_key}=${restore_val}" ;; esac
-  done < "$restore_source"
-  commit_if_requested
-  if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"
-  else ok "$c restored from $restore_source; not applied."
-  fi
+  c=$1; validate_client "$c"; merlin_preflight
+  if [ -n "$RESTORE_FILE" ]; then src=$RESTORE_FILE; else src=$(latest_backup "$c") || die "No backup found for $c."; fi
+  [ -r "$src" ] || die "Backup is not readable: $src"; grep -q "^${c}_" "$src" || die "Backup does not contain ${c}_* values."
+  confirm_write "$c from $src"; log "Safety backup: $(backup_client_force "$c")"
+  keys=$(tmpfile keys.txt); nvram show 2>/dev/null | grep "^${c}_" | cut -d= -f1 | sort > "$keys" || true
+  while IFS= read -r k; do [ -n "$k" ] && nvram unset "$k"; done < "$keys"
+  while IFS='=' read -r k v; do case "$k" in "${c}_"*) nvram set "${k}=${v}" ;; esac; done < "$src"
+  commit_if_requested; if [ "$APPLY_REQUESTED" = "1" ]; then apply_client "$c"; else ok "$c restored; not applied."; fi
 }
 
 toggle_client() {
-  c=$1
-  toggle_value=$2
-  toggle_word=$3
-  validate_client "$c"
-  merlin_preflight
-  confirm_write "$c ($toggle_word)"
-  backup_client "$c"
-  nvram set "${c}_enable=${toggle_value}"
-  commit_if_requested
-  if [ "$APPLY_REQUESTED" = "1" ]; then
-    if [ "$toggle_value" = "1" ]; then start_client "$c"; else stop_client "$c"; fi
-  else
-    ok "$c set to $toggle_word; not applied."
-  fi
+  c=$1; val=$2; word=$3; validate_client "$c"; merlin_preflight; confirm_write "$c ($word)"; backup_client "$c"; nvram set "${c}_enable=${val}"; commit_if_requested
+  if [ "$APPLY_REQUESTED" = "1" ]; then [ "$val" = "1" ] && start_client "$c" || stop_client "$c"; else ok "$c set to $word; not applied."; fi
 }
 
 prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--config" ]; then CONFIG_FILE="$arg"; prev=""; continue; fi
-  [ "$arg" = "--config" ] && prev="--config"
-done
+for arg in "$@"; do if [ "$prev" = "--config" ]; then CONFIG_FILE="$arg"; prev=""; continue; fi; [ "$arg" = "--config" ] && prev="--config"; done
 load_config
-
 [ "$#" -gt 0 ] || { usage; exit 0; }
-cmd=$1
-shift
-subcmd=""
-client=""
+cmd=$1; shift; subcmd=""; client=""
 
 if [ "$cmd" = "merlin" ]; then
-  [ "$#" -gt 0 ] || die "Missing merlin subcommand."
-  subcmd=$1
-  shift
-  case "$subcmd" in
-    show|status|diff|create|update|apply|restart|start|stop|enable|disable|backup|restore)
-      [ "$#" -gt 0 ] || die "Missing wgcN client."
-      client=$1
-      shift
-      ;;
-  esac
-  if [ "$subcmd" = "restore" ] && [ "$#" -gt 0 ]; then
-    case "$1" in --*) ;; *) RESTORE_FILE=$1; shift ;; esac
-  fi
+  [ "$#" -gt 0 ] || die "Missing merlin subcommand."; subcmd=$1; shift
+  case "$subcmd" in show|status|ip|verify|diff|create|update|refresh|apply|restart|start|stop|enable|disable|backup|restore) [ "$#" -gt 0 ] || die "Missing wgcN client."; client=$1; shift ;; esac
+  if [ "$subcmd" = "restore" ] && [ "$#" -gt 0 ]; then case "$1" in --*) ;; *) RESTORE_FILE=$1; shift ;; esac; fi
 fi
 
 while [ "$#" -gt 0 ]; do
@@ -682,15 +487,15 @@ while [ "$#" -gt 0 ]; do
     --city) [ "$#" -ge 2 ] || die "Missing value after --city"; CITY=$2; shift 2 ;;
     --server) [ "$#" -ge 2 ] || die "Missing value after --server"; SERVER=$2; shift 2 ;;
     --group) [ "$#" -ge 2 ] || die "Missing value after --group"; GROUP=$2; shift 2 ;;
-    --limit) [ "$#" -ge 2 ] || die "Missing value after --limit"; LIMIT=$2; shift 2 ;;
-    --config) [ "$#" -ge 2 ] || die "Missing value after --config"; CONFIG_FILE=$2; shift 2 ;;
-    --token) [ "$#" -ge 2 ] || die "Missing value after --token"; ACCESS_TOKEN=$2; shift 2 ;;
-    --token-file) [ "$#" -ge 2 ] || die "Missing value after --token-file"; TOKEN_FILE=$2; shift 2 ;;
-    --desc) [ "$#" -ge 2 ] || die "Missing value after --desc"; DESCRIPTION=$2; shift 2 ;;
-    --dns) [ "$#" -ge 2 ] || die "Missing value after --dns"; WG_DNS=$2; shift 2 ;;
-    --keepalive) [ "$#" -ge 2 ] || die "Missing value after --keepalive"; WG_KEEPALIVE=$2; shift 2 ;;
-    --mtu) [ "$#" -ge 2 ] || die "Missing value after --mtu"; WG_MTU=$2; shift 2 ;;
-    --endpoint) [ "$#" -ge 2 ] || die "Missing value after --endpoint"; MERLIN_ENDPOINT_MODE=$2; shift 2 ;;
+    --limit) LIMIT=$2; shift 2 ;;
+    --config) CONFIG_FILE=$2; shift 2 ;;
+    --token) ACCESS_TOKEN=$2; shift 2 ;;
+    --token-file) TOKEN_FILE=$2; shift 2 ;;
+    --desc) DESCRIPTION=$2; shift 2 ;;
+    --dns) WG_DNS=$2; shift 2 ;;
+    --keepalive) WG_KEEPALIVE=$2; shift 2 ;;
+    --mtu) WG_MTU=$2; shift 2 ;;
+    --endpoint) MERLIN_ENDPOINT_MODE=$2; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --show-secrets) SHOW_SECRETS=1; shift ;;
     --apply) APPLY_REQUESTED=1; shift ;;
@@ -713,9 +518,12 @@ case "$cmd" in
       list) merlin_list ;;
       show) merlin_show "$client" ;;
       status) merlin_status "$client" ;;
+      ip) merlin_ip "$client" ;;
+      verify) merlin_verify "$client" ;;
       diff) merlin_diff "$client" ;;
       create) merlin_create "$client" ;;
       update) merlin_update "$client" ;;
+      refresh) merlin_refresh "$client" ;;
       apply|restart) apply_client "$client" ;;
       start) start_client "$client" ;;
       stop) stop_client "$client" ;;
