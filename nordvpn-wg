@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.4.2
+# v0.4.3
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.4.2"
+VERSION="0.4.3"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -43,6 +43,10 @@ CITY=""
 SERVER=""
 GROUP=""
 DESCRIPTION=""
+COUNTRY_SET="0"
+CITY_SET="0"
+GROUP_SET="0"
+DESCRIPTION_SET="0"
 LIMIT="10"
 ASSUME_YES="0"
 SHOW_SECRETS="0"
@@ -366,7 +370,7 @@ metadata_file() { printf '%s/slots/%s.json' "$STATE_DIR" "$1"; }
 save_metadata() {
   meta_c=$1; need jq; mkdir -p "$STATE_DIR/slots"; meta_file=$(metadata_file "$meta_c")
   meta_country=$COUNTRY; [ -n "$meta_country" ] || meta_country=$country_code; [ -n "$meta_country" ] || meta_country=$country_name
-  meta_city=$CITY; [ -n "$meta_city" ] || [ "$city_name" = "Unknown" ] || meta_city=$city_name
+  meta_city=$CITY
   meta_group=$GROUP; meta_desc=$(profile_desc)
   jq -n --arg slot "$meta_c" --arg provider "NordVPN" --arg country "$meta_country" --arg city "$meta_city" --arg group "$meta_group" --arg server "$hostname" --arg description "$meta_desc" --arg updated "$(date '+%Y-%m-%dT%H:%M:%S%z')" '{slot:$slot,provider:$provider,country:$country,city:$city,group:$group,last_server:$server,description:$description,updated_at:$updated}' > "$meta_file"
   chmod 600 "$meta_file"; log "Metadata: $meta_file"
@@ -375,10 +379,14 @@ save_metadata() {
 load_refresh_metadata() {
   c=$1; need jq; meta_file=$(metadata_file "$c")
   if [ -r "$meta_file" ]; then
-    [ -n "$COUNTRY" ] || COUNTRY=$(jq -r '.country // ""' "$meta_file")
-    [ -n "$CITY" ] || CITY=$(jq -r '.city // ""' "$meta_file")
-    [ -n "$GROUP" ] || GROUP=$(jq -r '.group // ""' "$meta_file")
-    [ -n "$DESCRIPTION" ] || DESCRIPTION=$(jq -r '.description // ""' "$meta_file")
+    if [ "$COUNTRY_SET" != "1" ]; then COUNTRY=$(jq -r '.country // ""' "$meta_file"); fi
+    if [ "$CITY_SET" != "1" ]; then
+      if [ "$COUNTRY_SET" = "1" ]; then CITY=""; else CITY=$(jq -r '.city // ""' "$meta_file"); fi
+    fi
+    if [ "$GROUP_SET" != "1" ]; then GROUP=$(jq -r '.group // ""' "$meta_file"); fi
+    if [ "$DESCRIPTION_SET" != "1" ]; then
+      if [ "$COUNTRY_SET" = "1" ] || [ "$CITY_SET" = "1" ]; then DESCRIPTION=""; else DESCRIPTION=$(jq -r '.description // ""' "$meta_file"); fi
+    fi
   fi
   [ -n "$COUNTRY$CITY$GROUP" ] || die "No remembered selectors for $c. Seed them once with: $APP_NAME merlin refresh $c --country US --city Dallas --apply"
   SERVER=""
@@ -501,15 +509,15 @@ fi
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --country) [ "$#" -ge 2 ] || die "Missing value after --country"; COUNTRY=$2; shift 2 ;;
-    --city) [ "$#" -ge 2 ] || die "Missing value after --city"; CITY=$2; shift 2 ;;
+    --country) [ "$#" -ge 2 ] || die "Missing value after --country"; COUNTRY=$2; COUNTRY_SET=1; shift 2 ;;
+    --city) [ "$#" -ge 2 ] || die "Missing value after --city"; CITY=$2; CITY_SET=1; shift 2 ;;
     --server) [ "$#" -ge 2 ] || die "Missing value after --server"; SERVER=$2; shift 2 ;;
-    --group) [ "$#" -ge 2 ] || die "Missing value after --group"; GROUP=$2; shift 2 ;;
+    --group) [ "$#" -ge 2 ] || die "Missing value after --group"; GROUP=$2; GROUP_SET=1; shift 2 ;;
     --limit) LIMIT=$2; shift 2 ;;
     --config) CONFIG_FILE=$2; shift 2 ;;
     --token) ACCESS_TOKEN=$2; shift 2 ;;
     --token-file) TOKEN_FILE=$2; shift 2 ;;
-    --desc) DESCRIPTION=$2; shift 2 ;;
+    --desc) DESCRIPTION=$2; DESCRIPTION_SET=1; shift 2 ;;
     --dns) WG_DNS=$2; shift 2 ;;
     --keepalive) WG_KEEPALIVE=$2; shift 2 ;;
     --mtu) WG_MTU=$2; shift 2 ;;
