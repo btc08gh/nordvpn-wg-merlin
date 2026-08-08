@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.4.0
+# v0.4.1
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.4.0"
+VERSION="0.4.1"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -65,7 +65,7 @@ Runs under the stock Merlin /bin/sh. Entware curl and jq are required.
 
 Usage:
   $APP_NAME countries
-  $APP_NAME servers [--country NAME|CODE] [--city NAME] [--limit N]
+  $APP_NAME servers [--country NAME|CODE] [--city NAME] [--group NAME] [--limit N]
   $APP_NAME auth-test
 
   $APP_NAME merlin list
@@ -92,7 +92,7 @@ Options:
   --country NAME|CODE
   --city NAME
   --server HOSTNAME
-  --group NAME
+  --group NAME              Friendly names supported; p2p maps to Nord legacy_p2p
   --limit N
   --config FILE
   --token TOKEN
@@ -193,6 +193,17 @@ fetch_private_key() {
 
 normalize() { printf '%s' "$1" | tr '[:upper:] -' '[:lower:]__'; }
 
+normalize_group() {
+  ng=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$ng" in
+    p2p|legacy-p2p|legacy_p2p) printf 'legacy_p2p' ;;
+    double-vpn|double_vpn) printf 'legacy_double_vpn' ;;
+    onion-over-vpn|onion_over_vpn) printf 'legacy_onion_over_vpn' ;;
+    dedicated-ip|dedicated_ip) printf 'legacy_dedicated_ip' ;;
+    *) printf '%s' "$ng" ;;
+  esac
+}
+
 resolve_country_id() {
   req=$(normalize "$1"); f=$(tmpfile countries.json)
   api_get "${NORD_API}/servers/countries" > "$f" || return 1
@@ -211,17 +222,25 @@ fetch_candidates_to_file() {
     jq -c --arg h "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" '[.[] | select(((.hostname // "")|ascii_downcase)==$h) | select(any(.technologies[]?; .identifier=="wireguard_udp"))]' "$raw" > "$out"
     return
   fi
+
+  api_group=""
+  [ -z "$GROUP" ] || api_group=$(normalize_group "$GROUP")
+
   url="${NORD_API}/servers/recommendations?filters[servers.status]=online&filters[servers_technologies][identifier]=wireguard_udp&limit=100"
   if [ -n "$COUNTRY" ]; then
     cid=$(resolve_country_id "$COUNTRY") || die "Unknown NordVPN country: $COUNTRY"
     [ -n "$cid" ] || die "Unknown NordVPN country: $COUNTRY"
     url="${url}&filters[country_id]=${cid}"
   fi
+  if [ -n "$api_group" ]; then
+    url="${url}&filters[servers_groups][identifier]=${api_group}"
+  fi
+
   api_get "$url" > "$raw" || die "Unable to retrieve Nord server recommendations."
-  jq -c --arg city "$CITY" --arg group "$GROUP" '[.[]
+  jq -c --arg city "$CITY" --arg group "$api_group" '[.[]
     | select(any(.technologies[]?; .identifier=="wireguard_udp"))
     | select(($city=="") or (((.locations[0].country.city.name // "")|ascii_downcase)==($city|ascii_downcase)))
-    | select(($group=="") or any(.groups[]?; (((.identifier // "")|ascii_downcase)==($group|ascii_downcase)) or (((.title // "")|ascii_downcase)==($group|ascii_downcase))))]' "$raw" > "$out"
+    | select(($group=="") or any(.groups[]?; (((.identifier // "")|ascii_downcase)==($group|ascii_downcase))))]' "$raw" > "$out"
 }
 
 list_countries() { need jq; api_get "${NORD_API}/servers/countries" | jq -r '.[] | [.code,.name] | @tsv' | sort -k2; }
