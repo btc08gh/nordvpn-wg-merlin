@@ -1,6 +1,6 @@
 #!/bin/sh
 # NordVPN WireGuard Manager for Asuswrt-Merlin
-# v0.4.1
+# v0.4.2
 # Runtime: Asuswrt-Merlin stock /bin/sh (BusyBox ash)
 set -eu
 
@@ -8,7 +8,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
 
 APP_NAME="nordvpn-wg"
-VERSION="0.4.1"
+VERSION="0.4.2"
 NORD_API="https://api.nordvpn.com/v1"
 DEFAULT_CONFIG="/opt/etc/nordvpn-wg.conf"
 DEFAULT_TOKEN_FILE="/opt/etc/nordvpn-wg/token"
@@ -237,10 +237,9 @@ fetch_candidates_to_file() {
   fi
 
   api_get "$url" > "$raw" || die "Unable to retrieve Nord server recommendations."
-  jq -c --arg city "$CITY" --arg group "$api_group" '[.[]
+  jq -c --arg city "$CITY" '[.[]
     | select(any(.technologies[]?; .identifier=="wireguard_udp"))
-    | select(($city=="") or (((.locations[0].country.city.name // "")|ascii_downcase)==($city|ascii_downcase)))
-    | select(($group=="") or any(.groups[]?; (((.identifier // "")|ascii_downcase)==($group|ascii_downcase))))]' "$raw" > "$out"
+    | select(($city=="") or (((.locations[0].country.city.name // "")|ascii_downcase)==($city|ascii_downcase)))]' "$raw" > "$out"
 }
 
 list_countries() { need jq; api_get "${NORD_API}/servers/countries" | jq -r '.[] | [.code,.name] | @tsv' | sort -k2; }
